@@ -14,7 +14,11 @@
       "Skill(code-review)",
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(New-Item -ItemType Directory -Force -Path \"archive\")",
+      "Bash(Out-Null)",
+      "Bash(Move-Item -Path \"example/manual_feature_selection.py\" -Destination \"archive/manual_feature_selection.py\" -Force)",
+      "PowerShell(New-Item *)"
     ]
   }
 }

@@ -19,7 +19,6 @@ from src.leave_one_out_validation import leave_one_out_validation
 from src.logger_config import setup_logger
 from sklearn.preprocessing import MinMaxScaler
 from src.visualization import plot_scatter
-from src.leave_one_out_validation import leave_one_out_validation
 from src.y_randomization import y_randomization_test
 from src.gplearn_wrapper import GPLearnRegressor
 
@@ -68,7 +67,7 @@ def clean_old_versions(model_dir, keep_versions=2):
     # and per-feature-count external validation.
     # Strategy: group iteration files by run timestamp, keep only the latest
     # `keep_versions` runs (same policy as final models). This ensures iteration
-    # snapshots remain available for manual_feature_selection.py and the
+    # snapshots remain available for manual_selection_and_plot.py and the
     # ensemble external validation module.
     iter_ts_pattern = re.compile(r'_iteration_\d+_(\d{8}_\d{6})\.joblib$')
     iter_by_run = {}  # timestamp → list of (filepath, metrics_path)

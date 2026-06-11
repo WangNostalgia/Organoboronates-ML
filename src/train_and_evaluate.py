@@ -19,6 +19,8 @@ import logging
 
 from src.evaluation import repeated_kfold_evaluate  # Unified evaluation center
 from src.gplearn_wrapper import GPLearnRegressor
+from src.fixed_params import get_fixed_params  # Single source of truth — used in objective() and train_and_evaluate()
+from sklearn.base import clone  # Used to isolate model state in the 100-split stability loop
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +56,10 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
         Returns:
         float: The mean absolute error (MAE) for the current trial.
         """
-        # Pull the shared fixed-params base from the Single Source of Truth.
+        # Pull the shared fixed-params base from the Single Source of Truth
+        # (imported at module level — see top of file).
         # This guarantees Optuna tunes on the EXACT same configuration that
         # will be used in the deployed model — no silent config drift.
-        from src.fixed_params import get_fixed_params
         base_params = get_fixed_params(model_class, n_jobs).copy()
 
         if model_class == LinearRegression:
@@ -316,9 +318,7 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
 
         return np.mean(mae_list)
 
-    # Pull fixed params from the single source of truth (deduplicated)
-    from src.fixed_params import get_fixed_params
-    # Merge CatBoost into FIXED_PARAMS_MAP if available
+    # Pull fixed params from the single source of truth (imported at module level)
     FIXED_PARAMS = get_fixed_params(model_class, n_jobs)
 
     # Ridge has no tunable params (RidgeCV handles alpha internally) — skip Optuna entirely
@@ -468,7 +468,10 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
     logger.info(f"Test RMSE: {rmse_test:.4f}")
     logger.info(f"Test MAE: {mae_test:.4f}")
 
-    # 100-split stability check (mean ± std only — NO best_random_state selection)
+    # 100-split stability check (mean ± std only — NO best_random_state selection).
+    # Each split uses a FRESH clone of best_model so the original model state
+    # (trained on the unified split, random_state=random_state) is preserved
+    # for the subsequent 5×5 RepeatedKFold evaluation below.
     mae_test_list = []
     for i in range(100):
         X_tr_i, X_te_i, y_tr_i, y_te_i = train_test_split(
@@ -477,8 +480,9 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
         X_tr_s = scaler_X.fit_transform(X_tr_i)
         X_te_s = scaler_X.transform(X_te_i)
         y_tr_s = scaler_y.fit_transform(y_tr_i.values.reshape(-1, 1)).ravel()
-        best_model.fit(X_tr_s, y_tr_s)
-        y_pred_s = best_model.predict(X_te_s)
+        fold_model = clone(best_model)
+        fold_model.fit(X_tr_s, y_tr_s)
+        y_pred_s = fold_model.predict(X_te_s)
         y_pred_i = scaler_y.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
         mae_test_list.append(mean_absolute_error(y_te_i, y_pred_i))
     mae_test_mean = np.mean(mae_test_list)

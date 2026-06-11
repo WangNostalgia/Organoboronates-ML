@@ -563,7 +563,7 @@ def ensemble_validation(ensemble_csv,
     Load multiple models specified in a CSV file, run predictions on external
     data, and aggregate results using simple-mean and weighted-mean strategies.
 
-    The CSV format follows the same convention as manual_feature_selection.py:
+    The CSV format follows the same convention as manual_selection_and_plot.py:
 
         model_name,n_features
         SVR,4

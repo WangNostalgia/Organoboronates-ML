@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
+# ==============================================================================
+# DEPRECATED: This module has been archived on 2026-06-11.
+# Its functionality is fully superseded by example/manual_selection_and_plot.py,
+# which provides the same checkpoint-loading and prediction capabilities plus
+# integrated scatter-plot generation with RKfold metrics, all backed by a
+# CSV-driven selection file (manual_feature_selection.csv).
+# DO NOT import or call from active workflows.
+# ==============================================================================
+raise DeprecationWarning(
+    "This legacy module has been archived. "
+    "Use example/manual_selection_and_plot.py instead."
+)
+
 """
 ===============================================================================
-  Manual Feature-Count Selection & External Prediction
+  Manual Feature-Count Selection & External Prediction (DEPRECATED)
 ===============================================================================
 
 When the SHAP-RFECV auto-selection picks a feature count (e.g., 7) based on

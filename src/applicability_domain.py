@@ -351,18 +351,17 @@ def _compute_williams(X_train_scaled, X_ext_scaled,
         # Set to NaN and skip residual-based warnings.
         residuals_ext = np.full(len(X_ext_scaled), np.nan)
 
-    # Estimate residual std from training set if available, otherwise from
-    # external set, otherwise default.
-    if y_train is not None:
-        X_tr_scaled_for_pred = scaler_X.transform(
-            X_train_scaled  # already scaled, but we use the model's internal scaler
-        )
-        # Actually, we need the UNSCALED training features to predict properly
-        # Re-derive training residuals using the model's scalers
-        pass
-
-    # For kernel models (SVR, KRR, etc.), the hat matrix approximation from
-    # linear feature space is coarse.  We note this in the output.
+    # NOTE: Training-set residuals are NOT computed here because the Williams
+    # plot function receives externally-scaled training features (StandardScaler)
+    # while the model expects MinMaxScaler-transformed features.  Computing
+    # training residuals would require the ORIGINAL (unscaled) training data,
+    # which is not part of this function's interface.  The residual standard
+    # deviation is therefore estimated from the external residuals, which is
+    # conservative (external residuals tend to be larger than training residuals,
+    # making the ±3σ threshold wider and less likely to flag borderline cases).
+    #
+    # If training residuals are needed, the caller should pass unscaled X_train
+    # and y_train, and the model's own scaler_X / scaler_y should be used.
     residual_sigma = _estimate_residual_std(residuals_ext)
 
     # Standardized residuals (using LOOCV variance scaling)

@@ -43,6 +43,9 @@ def get_fixed_params(model_class, n_jobs=-1):
     -------
     dict : fixed parameter names → values (empty dict if model not in map)
     """
+    # NOTE: This dict is defined inside the function (not at module level)
+    # because several entries reference the runtime `n_jobs` parameter.
+    # The dict is small (<20 entries) so the recreation cost is negligible.
     FIXED_PARAMS_MAP = {
         LinearRegression: {},
         Ridge: {},  # RidgeCV handles alpha internally
