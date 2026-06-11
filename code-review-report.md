@@ -116,13 +116,24 @@ It reads the same `example/manual_feature_selection.csv` format and provides all
 
 ## 3. Remaining Concerns & Recommendations
 
-### 3.1 Williams Plot residual estimation (inherent limitation, not a bug)
+### 3.1 Williams Plot residual estimation ✅ RESOLVED (2026-06-11)
 
-The Williams plot in `applicability_domain.py` estimates residual standard deviation from external residuals only, not training residuals. This is documented in the new comment block. If more accurate standardization is desired, the caller should pass **unscaled** training data and the function should use the model's own scalers.
+~~The Williams plot in `applicability_domain.py` estimates residual standard deviation from external residuals only, not training residuals.~~
 
-### 3.2 SHAP reproducibility — `shap.kmeans` non-determinism
+**Fix**: `_compute_williams()` now accepts an `X_train_unscaled` parameter. When provided (alongside `y_train`), the function uses the model's own `scaler_X` (MinMaxScaler) to transform the unscaled training features, computes training-set predictions via `model.predict()`, inverse-transforms with `scaler_y`, and derives training residuals. These training residuals drive the `_estimate_residual_std()` sigma estimation, with external residuals as fallback. This makes the Williams Plot ±3σ threshold more accurate, based on the model's typical error distribution rather than external data alone.
 
-`feature_selection.py` line 124 calls `shap.kmeans(X_te_s, n_clusters)` without a `random_state` parameter. In older versions of SHAP, `kmeans` has no random_state argument. In newer versions (≥0.42), it does. The K-means initialization is non-deterministic without a fixed seed, which means SHAP values for KernelExplainer models (SVR, KNR, MLP, GPR, KRR) may vary slightly between runs. This affects ~7 of 16 model types. **Recommendation**: Pin the numpy random seed before calling `shap.kmeans`, or upgrade SHAP and pass `random_state=42`.
+### 3.2 SHAP reproducibility — `shap.kmeans` non-determinism ✅ RESOLVED (2026-06-11)
+
+~~`feature_selection.py` calls `shap.kmeans(X_te_s, n_clusters)` without a `random_state` parameter.~~ shap 0.47.2's `kmeans()` does not accept `random_state` (passing it causes TypeError — confirmed in revision_8).
+
+**Fix**: Both `shap.kmeans()` call sites (single-fit path line 80 and multi-fold consensus path line 124) now wrap the call with numpy random state save/restore:
+```python
+_stashed = np.random.get_state()
+np.random.seed(42)
+background = shap.kmeans(X_scaled, n_clusters)
+np.random.set_state(_stashed)
+```
+This pins the global numpy seed during KMeans initialisation without polluting other modules (Optuna, train/test splits). Affects ~7 of 16 model types that use KernelExplainer (SVR, KNR, MLP, GPR, KRR, GPlearn, ElasticNet with specific configurations).
 
 ### 3.3 CatBoost version sensitivity
 
@@ -136,6 +147,8 @@ The off-by-one checkpoint save bug (fixed in the previous session) means **exist
 
 ## 4. Modified Files Summary
 
+### Round 1 (initial code review)
+
 | File | Change | Category |
 |------|--------|----------|
 | `archive/manual_feature_selection.py` | Moved from `example/`, added `DeprecationWarning` guard | Archival |
@@ -144,22 +157,23 @@ The off-by-one checkpoint save bug (fixed in the previous session) means **exist
 | `src/iterative_optimization.py` | Removed duplicate `leave_one_out_validation` import; updated comment reference | Quality |
 | `src/fixed_params.py` | Added comment explaining in-function dict design | Quality |
 | `src/external_validation.py` | Updated comment reference to archived file | Quality |
+
+### Round 2 (remaining concerns 3.1 & 3.2)
+
+| File | Change | Category |
+|------|--------|----------|
+| `src/applicability_domain.py` | Added `X_train_unscaled` param; training residuals drive Williams sigma estimation | Enhancement |
+| `src/feature_selection.py` | numpy seed save/restore around both `shap.kmeans()` calls for reproducibility | Enhancement |
 | `code-review-report.md` | This report | Documentation |
 
-### Verification Results
+### Verification Results (Round 2)
 
 ```
-PASS: fixed_params.py
-PASS: evaluation.py
-PASS: gplearn_wrapper.py
-PASS: feature_selection.py
-PASS: iterative_optimization.py (no duplicate imports)
-PASS: train_and_evaluate.py
-PASS: applicability_domain.py
-PASS: external_validation.py
-PASS: iterative_optimization.py (import)
-PASS: train_and_evaluate.py (import)
+SYNTAX OK: src/feature_selection.py
+SYNTAX OK: src/applicability_domain.py
+PASS: feature_selection.py — both shap.kmeans sites have seed save/restore
+PASS: applicability_domain.py — training residual pipeline complete
+PASS: feature_selection.py import
+PASS: applicability_domain.py import
 All verification checks passed.
 ```
-
-All modified files pass Python syntax checks, import correctly, and contain the expected fix patterns.
