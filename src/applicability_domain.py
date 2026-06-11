@@ -167,6 +167,7 @@ def applicability_domain_analysis(model_info, X_train, X_external,
         model, scaler_X, scaler_y,
         y_train, y_external, y_pred_external,
         p, n_train, expected_features,
+        X_train_unscaled=X_train_feat,  # Pass unscaled features for training residual computation
     )
 
     # ── 2. k-NN Distance ────────────────────────────────────────────────
@@ -286,7 +287,8 @@ def applicability_domain_analysis(model_info, X_train, X_external,
 def _compute_williams(X_train_scaled, X_ext_scaled,
                       model, scaler_X, scaler_y,
                       y_train, y_external, y_pred_external,
-                      p, n_train, feature_names):
+                      p, n_train, feature_names,
+                      X_train_unscaled=None):
     """
     Compute leverage (hat values), standardized residuals, and warning
     thresholds for the Williams plot.
@@ -297,6 +299,10 @@ def _compute_williams(X_train_scaled, X_ext_scaled,
     Standardized residuals use LOOCV-style variance:
       r_std_i = r_i / (sigma * sqrt(1 - h_i))
     where sigma is estimated from the residual standard deviation.
+
+    When X_train_unscaled and y_train are both provided, training-set
+    residuals are computed using the model's own scalers (MinMaxScaler)
+    and combined with external residuals for a more robust sigma estimate.
 
     For models where the hat matrix cannot be derived analytically (e.g.,
     SVR with RBF kernel), we use a proximity-based pseudo-leverage computed
@@ -351,18 +357,42 @@ def _compute_williams(X_train_scaled, X_ext_scaled,
         # Set to NaN and skip residual-based warnings.
         residuals_ext = np.full(len(X_ext_scaled), np.nan)
 
-    # NOTE: Training-set residuals are NOT computed here because the Williams
-    # plot function receives externally-scaled training features (StandardScaler)
-    # while the model expects MinMaxScaler-transformed features.  Computing
-    # training residuals would require the ORIGINAL (unscaled) training data,
-    # which is not part of this function's interface.  The residual standard
-    # deviation is therefore estimated from the external residuals, which is
-    # conservative (external residuals tend to be larger than training residuals,
-    # making the ±3σ threshold wider and less likely to flag borderline cases).
-    #
-    # If training residuals are needed, the caller should pass unscaled X_train
-    # and y_train, and the model's own scaler_X / scaler_y should be used.
-    residual_sigma = _estimate_residual_std(residuals_ext)
+    # ── Compute training-set residuals (when unscaled features available) ─
+    # Training residuals provide a more accurate baseline for sigma estimation
+    # than external residuals alone.  The model's own MinMaxScaler is used to
+    # transform unscaled training features, ensuring consistency with how the
+    # model was originally trained.
+    residuals_train = None
+    if X_train_unscaled is not None and y_train is not None:
+        try:
+            X_tr_model_scaled = scaler_X.transform(X_train_unscaled)
+            y_pred_train_scaled = model.predict(X_tr_model_scaled)
+            y_pred_train = scaler_y.inverse_transform(
+                y_pred_train_scaled.reshape(-1, 1)
+            ).ravel()
+            residuals_train = np.asarray(y_train).ravel() - y_pred_train
+            logger.info(
+                "Training residuals computed: n=%d, mean=%.4f, std=%.4f",
+                len(residuals_train),
+                float(np.mean(residuals_train)),
+                float(np.std(residuals_train, ddof=1)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute training residuals: %s. "
+                "Falling back to external-residual-only sigma.", exc
+            )
+            residuals_train = None
+
+    # Estimate residual sigma from training residuals (preferred) or external
+    # residuals (fallback).  Training residuals are more representative of the
+    # model's typical error distribution, making the ±3σ threshold more accurate.
+    if residuals_train is not None and len(residuals_train) >= 2:
+        residual_sigma = _estimate_residual_std(residuals_train)
+        logger.info("Williams sigma estimated from training residuals: %.4f", residual_sigma)
+    else:
+        residual_sigma = _estimate_residual_std(residuals_ext)
+        logger.info("Williams sigma estimated from external residuals (fallback): %.4f", residual_sigma)
 
     # Standardized residuals (using LOOCV variance scaling)
     with np.errstate(divide='ignore', invalid='ignore'):

@@ -77,7 +77,14 @@ def shap_rfecv_select_worst_feature(model, X, y, model_name, corr_threshold=0.8,
             n_samples = max(1, min(n_samp_desired, len(X_scaled)))
             # Local RandomState isolates SHAP from global numpy seed (no pollution)
             rng = np.random.RandomState(42)
+            # shap.kmeans (0.47.2) does NOT accept a random_state parameter.
+            # KMeans initialisation is non-deterministic without a fixed seed,
+            # so we temporarily set the global numpy seed and restore it
+            # afterwards to avoid polluting other modules (e.g. Optuna).
+            _stashed = np.random.get_state()
+            np.random.seed(42)
             background = shap.kmeans(X_scaled, n_clusters)
+            np.random.set_state(_stashed)
             explainer = shap.KernelExplainer(m.predict, background)
             sample_indices = rng.choice(len(X_scaled), n_samples, replace=False)
             sv = explainer.shap_values(X_scaled[sample_indices])
@@ -121,7 +128,13 @@ def shap_rfecv_select_worst_feature(model, X, y, model_name, corr_threshold=0.8,
                     n_clusters = max(1, min(n_clust_desired, len(X_te_s)))
                     n_samp_desired = max(5, min(int(len(X_te_s) * 0.5), len(X_te_s)))
                     n_samples = max(1, min(n_samp_desired, len(X_te_s)))
-                    bg = shap.kmeans(X_te_s, n_clusters)  # shap.kmeans signature: kmeans(X, k, ...) — no random_state param
+                    # shap.kmeans (0.47.2) does NOT accept random_state.
+                    # Pin numpy seed during KMeans init for reproducibility,
+                    # then restore to avoid polluting downstream modules.
+                    _stashed = np.random.get_state()
+                    np.random.seed(42)
+                    bg = shap.kmeans(X_te_s, n_clusters)
+                    np.random.set_state(_stashed)
                     explainer = shap.KernelExplainer(m.predict, bg)
                     sample_idx = rng.choice(len(X_te_s), n_samples, replace=False)
                     sv = explainer.shap_values(X_te_s[sample_idx])
