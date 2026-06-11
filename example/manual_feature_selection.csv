@@ -1,0 +1,16 @@
+model_name,n_features
+SVR,8
+Ridge,7
+LinearRegression,7
+Lasso,5
+KRR,6
+RandomForest,8
+AdaBoost,5
+GradientBoosting,6
+LightGBM,4
+CatBoost,8
+XGBoost,5
+KNR,7
+ElasticNet,4
+MLP,5
+DecisionTree,6
