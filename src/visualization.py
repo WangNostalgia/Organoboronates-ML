@@ -257,8 +257,8 @@ def plot_scatter_standard(y_train, y_pred_train, y_test, y_pred_test, model_name
     plt.gca().set_aspect('equal', adjustable='box')
     
     # Plot normal points (deviation < 5.0)
-    plt.scatter(y_train, y_pred_train, color='blue', label='Train')
-    plt.scatter(y_test, y_pred_test, color='green', label='Test')
+    plt.scatter(y_train, y_pred_train, color='blue', label='Development')
+    plt.scatter(y_test, y_pred_test, color='green', label='Final Test')
     plt.xlabel('True Values/(kcal/mol)', fontsize=fontsize, fontname=fontname)
     plt.ylabel('Predicted Values/(kcal/mol)', fontsize=fontsize, fontname=fontname)
     # plt.title(f'Actual vs Predicted Values for {model_name}', fontsize=fontsize, fontname=fontname)

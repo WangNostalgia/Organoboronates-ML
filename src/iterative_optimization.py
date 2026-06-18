@@ -401,6 +401,11 @@ def iterative_optimization(
 
     for model_name, model_class in models.items():
         logger.info("Starting model: %s", model_name)
+        if model_class == GPLearnRegressor and force_n_features is not None:
+            raise ValueError(
+                "GPlearn cannot use force_n_features because inherent-selection "
+                "mode has no SHAP-RFECV path to force."
+            )
         model_dir = os.path.join(models_dir, model_name)
         os.makedirs(model_dir, exist_ok=True)
         clean_old_versions(model_dir, keep_versions)
@@ -518,30 +523,6 @@ def iterative_optimization(
                     internal_cv["rkf_mae_std"],
                 )
 
-                if X_model.shape[1] <= effective_min_features:
-                    break
-
-                from src.feature_selection import shap_rfecv_select_worst_feature
-
-                use_consensus = X_model.shape[1] <= max(
-                    10, effective_min_features + 3
-                )
-                worst_feature, ranking, removal_reason = (
-                    shap_rfecv_select_worst_feature(
-                        artifacts["estimator"],
-                        X_model,
-                        y_development,
-                        model_name,
-                        cv_folds=5 if use_consensus else 0,
-                    )
-                )
-                logger.info(
-                    "SHAP-RFECV removes %s (%s); ranking=%s",
-                    worst_feature,
-                    removal_reason,
-                    ranking,
-                )
-
                 checkpoint_model, checkpoint_scaler_X, checkpoint_scaler_y, _ = (
                     _fit_on_development(
                         artifacts["estimator"], X_model, y_development
@@ -584,6 +565,30 @@ def iterative_optimization(
                         f"± {artifacts['stability_mae_std']:.4f}\n"
                         f"Complete Parameters: {artifacts['complete_params']}\n"
                     )
+
+                if X_model.shape[1] <= effective_min_features:
+                    break
+
+                from src.feature_selection import shap_rfecv_select_worst_feature
+
+                use_consensus = X_model.shape[1] <= max(
+                    10, effective_min_features + 3
+                )
+                worst_feature, ranking, removal_reason = (
+                    shap_rfecv_select_worst_feature(
+                        artifacts["estimator"],
+                        X_model,
+                        y_development,
+                        model_name,
+                        cv_folds=5 if use_consensus else 0,
+                    )
+                )
+                logger.info(
+                    "SHAP-RFECV removes %s (%s); ranking=%s",
+                    worst_feature,
+                    removal_reason,
+                    ranking,
+                )
 
                 removed_features.append(worst_feature)
                 X_model = X_model.drop(columns=[worst_feature])

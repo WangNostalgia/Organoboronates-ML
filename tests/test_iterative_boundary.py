@@ -1,5 +1,6 @@
 import inspect
 import logging
+import os
 import sys
 import tempfile
 import types
@@ -91,7 +92,11 @@ install_optional_dependency_stubs()
 import main
 import src.iterative_optimization as iterative_module
 from src.iterative_optimization import iterative_optimization
-from src.visualization import add_plot_labels, add_plot_labels_standard
+from src.visualization import (
+    add_plot_labels,
+    add_plot_labels_standard,
+    plot_scatter_standard,
+)
 
 
 def make_sentinel_dataset():
@@ -156,6 +161,20 @@ class FakeGPRegressor(BaseEstimator, RegressorMixin):
     def predict(self, X):
         values = np.asarray(X)
         return self.mean_ + 0.01 * values[:, 0]
+
+
+class TaggedRegressor(BaseEstimator, RegressorMixin):
+    def __init__(self, marker=73):
+        self.marker = marker
+
+    def fit(self, X, y):
+        self.mean_ = float(np.mean(y))
+        self.n_features_in_ = np.asarray(X).shape[1]
+        return self
+
+    def predict(self, X):
+        values = np.asarray(X)
+        return self.mean_ + 0.02 * values[:, 0]
 
 
 class IterativeBoundaryTests(unittest.TestCase):
@@ -387,6 +406,120 @@ class IterativeBoundaryTests(unittest.TestCase):
             3.0,
         )
 
+    def test_gplearn_rejects_forced_feature_count_before_training_or_persistence(self):
+        X, y = make_sentinel_dataset()
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            iterative_module,
+            "GPLearnRegressor",
+            FakeGPRegressor,
+        ), patch(
+            "src.iterative_optimization.os.getcwd",
+            return_value=tmpdir,
+        ), patch(
+            "src.iterative_optimization.setup_logger",
+            return_value=logging.getLogger("gplearn-force-test"),
+        ), patch(
+            "src.iterative_optimization.clean_old_versions",
+        ) as clean_mock, patch(
+            "src.iterative_optimization.hyperparameter_optimization_and_training",
+            return_value=make_artifacts(FakeGPRegressor, X.shape[1], n_jobs=1),
+        ) as tuning_mock, patch(
+            "src.iterative_optimization.leave_one_out_validation",
+            return_value=(0.1, 2.0),
+        ), patch(
+            "src.iterative_optimization.plot_performance_history",
+        ), patch(
+            "src.iterative_optimization.save_performance_history",
+        ), patch(
+            "src.iterative_optimization.plot_scatter",
+        ), patch(
+            "src.iterative_optimization.joblib.dump",
+        ) as dump_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                r"GPlearn.*force_n_features.*no SHAP-RFECV path",
+            ):
+                iterative_optimization(
+                    {"GPlearn": FakeGPRegressor},
+                    X,
+                    y,
+                    n_trials=1,
+                    n_jobs=1,
+                    force_n_features=2,
+                )
+
+        clean_mock.assert_not_called()
+        tuning_mock.assert_not_called()
+        dump_mock.assert_not_called()
+
+    def test_iteration_checkpoints_cover_complete_three_to_two_feature_path(self):
+        X, y = make_sentinel_dataset()
+        saved_payloads = {}
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(model_class, X_arg.shape[1], n_jobs=kwargs["n_jobs"])
+
+        def fake_shap(model, X_arg, y_arg, model_name, cv_folds):
+            return X_arg.columns[-1], list(zip(X_arg.columns, [1.0] * X_arg.shape[1])), "low_importance"
+
+        def capture_dump(payload, path):
+            saved_payloads[Path(path).name] = payload
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "src.iterative_optimization.os.getcwd",
+            return_value=tmpdir,
+        ), patch(
+            "src.iterative_optimization.setup_logger",
+            return_value=logging.getLogger("checkpoint-path-test"),
+        ), patch(
+            "src.iterative_optimization.clean_old_versions",
+        ), patch(
+            "src.iterative_optimization.hyperparameter_optimization_and_training",
+            side_effect=fake_tuning,
+        ), patch(
+            "src.feature_selection.shap_rfecv_select_worst_feature",
+            side_effect=fake_shap,
+        ), patch(
+            "src.iterative_optimization.leave_one_out_validation",
+            return_value=(0.55, 1.25),
+        ), patch(
+            "src.iterative_optimization.plot_performance_history",
+        ), patch(
+            "src.iterative_optimization.save_performance_history",
+        ), patch(
+            "src.iterative_optimization.plot_scatter",
+        ), patch(
+            "src.iterative_optimization.joblib.dump",
+            side_effect=capture_dump,
+        ):
+            iterative_optimization(
+                {"SVR": SVR},
+                X,
+                y,
+                n_trials=1,
+                n_jobs=1,
+                min_features=2,
+            )
+
+        checkpoints = [
+            payload
+            for filename, payload in sorted(saved_payloads.items())
+            if "_iteration_" in filename
+        ]
+        self.assertEqual(
+            [len(payload["features"]) for payload in checkpoints],
+            [3, 2],
+        )
+        for payload in checkpoints:
+            feature_count = len(payload["features"])
+            self.assertEqual(payload["model"].n_features_in_, feature_count)
+            self.assertEqual(payload["scaler_X"].n_features_in_, feature_count)
+            self.assertEqual(
+                payload["metrics"]["internal_cv"]["rkf_mae_mean"],
+                float(feature_count),
+            )
+
     def test_iterative_signature_and_main_parser_expose_only_current_selection_controls(self):
         signature = inspect.signature(iterative_optimization)
         self.assertNotIn("mae_threshold", signature.parameters)
@@ -456,6 +589,151 @@ class IterativeBoundaryTests(unittest.TestCase):
         self.assertIn("Internal CV MAE", labels)
         self.assertIn("LOOCV", labels)
         self.assertIn("secondary", labels)
+
+    def test_publication_scatter_legend_uses_development_and_final_test_labels(self):
+        y_development = np.array([1.0, 2.0, 3.0])
+        y_pred_development = np.array([1.1, 1.9, 3.1])
+        y_final_test = np.array([1.5, 2.5])
+        y_pred_final_test = np.array([1.4, 2.6])
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "src.visualization.plt.scatter"
+        ) as scatter_mock, patch(
+            "src.visualization.calculate_metrics",
+            return_value={
+                "r_train": 0.9,
+                "r_test": 0.8,
+                "r2_train": 0.7,
+                "rmse_test": 0.2,
+                "r2_test": 0.6,
+                "mae_test": 0.1,
+            },
+        ), patch(
+            "src.visualization.plt.savefig",
+        ):
+            plot_scatter_standard(
+                y_development,
+                y_pred_development,
+                y_final_test,
+                y_pred_final_test,
+                model_name="SVR",
+                mae_mean=None,
+                output_dir=tmpdir + os.sep,
+                output_name="publication.png",
+            )
+
+        self.assertEqual(
+            [call.kwargs["label"] for call in scatter_mock.call_args_list],
+            ["Development", "Final Test"],
+        )
+
+    def test_two_models_share_one_split_and_each_evaluate_final_test_once(self):
+        X, y = make_sentinel_dataset()
+        X_development, X_final_test, _, _ = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=40,
+        )
+        real_split = train_test_split
+        real_evaluate = iterative_module._evaluate_final_test_once
+        real_inverse_predict = iterative_module._inverse_predict
+        split_calls = []
+        evaluation_calls = []
+        prediction_calls = []
+
+        def recording_split(*args, **kwargs):
+            split_calls.append(kwargs.copy())
+            return real_split(*args, **kwargs)
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(model_class, X_arg.shape[1], n_jobs=kwargs["n_jobs"])
+
+        def recording_evaluate(
+            estimator,
+            scaler_X,
+            scaler_y,
+            X_development_arg,
+            y_development_arg,
+            X_final_test_arg,
+            y_final_test_arg,
+        ):
+            evaluation_calls.append(
+                (type(estimator), set(X_final_test_arg.index))
+            )
+            return real_evaluate(
+                estimator,
+                scaler_X,
+                scaler_y,
+                X_development_arg,
+                y_development_arg,
+                X_final_test_arg,
+                y_final_test_arg,
+            )
+
+        def recording_inverse_predict(estimator, scaler_y, X_scaled):
+            prediction_calls.append((type(estimator), len(X_scaled)))
+            return real_inverse_predict(estimator, scaler_y, X_scaled)
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "src.iterative_optimization.os.getcwd",
+            return_value=tmpdir,
+        ), patch(
+            "src.iterative_optimization.setup_logger",
+            return_value=logging.getLogger("two-model-boundary-test"),
+        ), patch(
+            "src.iterative_optimization.clean_old_versions",
+        ), patch(
+            "src.iterative_optimization.train_test_split",
+            side_effect=recording_split,
+        ), patch(
+            "src.iterative_optimization.hyperparameter_optimization_and_training",
+            side_effect=fake_tuning,
+        ), patch(
+            "src.iterative_optimization.leave_one_out_validation",
+            return_value=(0.55, 1.25),
+        ), patch(
+            "src.iterative_optimization._evaluate_final_test_once",
+            side_effect=recording_evaluate,
+        ), patch(
+            "src.iterative_optimization._inverse_predict",
+            side_effect=recording_inverse_predict,
+        ), patch(
+            "src.iterative_optimization.plot_performance_history",
+        ), patch(
+            "src.iterative_optimization.save_performance_history",
+        ), patch(
+            "src.iterative_optimization.plot_scatter",
+        ), patch(
+            "src.iterative_optimization.joblib.dump",
+        ):
+            iterative_optimization(
+                {"SVR": SVR, "Tagged": TaggedRegressor},
+                X,
+                y,
+                n_trials=1,
+                n_jobs=1,
+                min_features=3,
+            )
+
+        self.assertEqual(split_calls, [{"test_size": 0.2, "random_state": 40}])
+        self.assertEqual(
+            [model_class for model_class, _ in evaluation_calls],
+            [SVR, TaggedRegressor],
+        )
+        for _, observed_final_indices in evaluation_calls:
+            self.assertEqual(observed_final_indices, set(X_final_test.index))
+            self.assertTrue(
+                observed_final_indices.isdisjoint(set(X_development.index))
+            )
+
+        for model_class in (SVR, TaggedRegressor):
+            final_test_predictions = [
+                call
+                for call in prediction_calls
+                if call == (model_class, len(X_final_test))
+            ]
+            self.assertEqual(final_test_predictions, [(model_class, 4)])
 
 
 if __name__ == "__main__":
