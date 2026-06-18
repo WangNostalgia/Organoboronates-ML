@@ -105,21 +105,24 @@ def evaluate_baseline(baseline, X, y):
                  X_train=X_train,
                  X_test=X_test)
 
-def main():
-    # Parse command line arguments
+def build_argument_parser():
+    """Build the command-line parser for the training pipeline."""
     parser = argparse.ArgumentParser(description='Machine learning model training and evaluation')
     parser.add_argument('--n_jobs', type=int, default=-1, help='Number of CPU cores to use (-1 means using all cores)')
     parser.add_argument('--n_trials', type=int, default=100, help='Number of trials for Optuna optimization')
-    parser.add_argument('--mae_threshold', type=float, default=2.0, help='MAE threshold')
     parser.add_argument('--keep_versions', type=int, default=2, help='Number of versions to keep for each model')
-    parser.add_argument('--min_features', type=int, default=3,
+    parser.add_argument('--min_features', type=int, default=5,
                         help='Minimum number of features (floor for SHAP-RFECV auto-selection; '
                              'set low to let auto-selection explore the full path)')
     parser.add_argument('--force_n_features', type=int, default=None,
-                        help='Force a specific number of features (skip SHAP-RFECV auto-selection). '
-                             'Use this when manual inspection shows a different feature count is better '
-                             'than the one auto-selected by minimum RKfold MAE.')
-    args = parser.parse_args()
+                        help='Evaluate the SHAP-RFECV path through --min_features, then select the '
+                             'entry with this exact feature count instead of auto-selection.')
+    return parser
+
+
+def main():
+    # Parse command line arguments
+    args = build_argument_parser().parse_args()
     
     # Read data
     data = pd.read_csv('example/B_dataset.csv')
@@ -168,7 +171,6 @@ def main():
         X, 
         y, 
         n_trials=args.n_trials, 
-        mae_threshold=args.mae_threshold,
         n_jobs=args.n_jobs,
         keep_versions=args.keep_versions,
         min_features=args.min_features,

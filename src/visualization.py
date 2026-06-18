@@ -7,7 +7,8 @@ import pandas as pd
 import os
 
 def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mean, output_dir, output_name,
-               X_train=None, X_test=None, r2_loo=None, rkf_mae=None, rkf_r2=None):
+               X_train=None, X_test=None, r2_loo=None, rkf_mae=None, rkf_r2=None,
+               precomputed_metrics=None):
     """
     Plot actual vs predicted scatter plot and export outlier data (deviation >= 5.0).
 
@@ -21,8 +22,10 @@ def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mea
     output_name : str, output filename (PNG)
     X_train, X_test : DataFrame, optional, raw feature data for outlier CSV export
     r2_loo     : float, optional, LOOCV R²
-    rkf_mae    : float, optional, 5x5 RepeatedKFold MAE (PRIMARY metric)
-    rkf_r2     : float, optional, 5x5 RepeatedKFold R² (PRIMARY metric)
+    rkf_mae    : float, optional, development internal-CV MAE (secondary)
+    rkf_r2     : float, optional, development internal-CV R² (secondary)
+    precomputed_metrics : dict, optional, metrics calculated during the single
+        final-test evaluation; avoids evaluating the final test again for plotting
     """
     # Create output directory if it does not exist
     if not os.path.exists(output_dir):
@@ -49,8 +52,8 @@ def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mea
     test_outlier = test_diff >= 5.0
     
     # Plot normal points (deviation < 5.0)
-    plt.scatter(y_train[train_normal], y_pred_train[train_normal], color='blue', label='Train')
-    plt.scatter(y_test[test_normal], y_pred_test[test_normal], color='green', label='Test')
+    plt.scatter(y_train[train_normal], y_pred_train[train_normal], color='blue', label='Development')
+    plt.scatter(y_test[test_normal], y_pred_test[test_normal], color='green', label='Final Test')
     
     # Merge and plot outlier points (deviation >= 5.0)
     outlier_actual = np.concatenate([y_train[train_outlier], y_test[test_outlier]])
@@ -64,7 +67,7 @@ def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mea
         # Process training set outliers
         if np.any(train_outlier):
             train_outliers = {
-                'Set': ['Train'] * sum(train_outlier),
+                'Set': ['Development'] * sum(train_outlier),
                 'Actual': y_train[train_outlier],
                 'Predicted': y_pred_train[train_outlier],
                 'Difference': train_diff[train_outlier]
@@ -78,7 +81,7 @@ def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mea
         # Process test set outliers
         if np.any(test_outlier):
             test_outliers = {
-                'Set': ['Test'] * sum(test_outlier),
+                'Set': ['Final Test'] * sum(test_outlier),
                 'Actual': y_test[test_outlier],
                 'Predicted': y_pred_test[test_outlier],
                 'Difference': test_diff[test_outlier]
@@ -99,15 +102,19 @@ def plot_scatter(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mea
             # Print outlier statistics summary
             print(f"\nOutlier Statistics (deviation >= 5.0):")
             print(f"Total outliers: {len(outliers_df)}")
-            print(f"Training set outliers: {sum(train_outlier)}")
-            print(f"Test set outliers: {sum(test_outlier)}")
+            print(f"Development set outliers: {sum(train_outlier)}")
+            print(f"Final test set outliers: {sum(test_outlier)}")
             print(f"Outlier data saved to: {outliers_csv_path}\n")
     
     plt.plot([min(y_train), max(y_train)], [min(y_train), max(y_train)], 
              color='red', label='Perfect Prediction')
 
-    # Compute evaluation metrics
-    metrics = calculate_metrics(y_train, y_pred_train, y_test, y_pred_test)
+    # Reuse the metrics from the single final-test evaluation when available.
+    metrics = (
+        precomputed_metrics
+        if precomputed_metrics is not None
+        else calculate_metrics(y_train, y_pred_train, y_test, y_pred_test)
+    )
     
     # Add metric labels and text annotations
     if mae_mean is not None:
@@ -141,7 +148,7 @@ def calculate_metrics(y_train, y_pred_train, y_test, y_pred_test):
     }
 
 def add_plot_labels(metrics, mae_mean, model_name, r2_loo, rkf_mae=None, rkf_r2=None):
-    """Add evaluation metrics text to the right side of the scatter plot."""
+    """Mark final-test metrics primary and development validation secondary."""
     plt.xlabel('Actual Values')
     plt.ylabel('Predicted Values')
     plt.title(f'Actual vs Predicted Values for {model_name}')
@@ -155,18 +162,26 @@ def add_plot_labels(metrics, mae_mean, model_name, r2_loo, rkf_mae=None, rkf_r2=
     y_range = ymax - ymin
     y_spacing = y_range * 0.1
 
-    # Build metrics list — RKfold values appended at the top when available
+    # The untouched final test is primary. Selection metrics are secondary.
     metrics_text = [
-        fr"$Pearson \; R_{{train}}: {metrics['r_train']:.4f}$",
-        fr"$Pearson \; R_{{test}}: {metrics['r_test']:.4f}$",
-        fr"$RMSE_{{test}}: {metrics['rmse_test']:.4f}$",
-        fr"$MAE_{{test}}: {metrics['mae_test']:.4f}$",
-        fr'$MAE_{{mean}}: {mae_mean:.4f}$',
+        f"Development Pearson R (secondary): {metrics['r_train']:.4f}",
+        f"Final Test Pearson R (PRIMARY): {metrics['r_test']:.4f}",
+        f"Final Test RMSE (PRIMARY): {metrics['rmse_test']:.4f}",
+        f"Final Test MAE (PRIMARY): {metrics['mae_test']:.4f}",
+        f"Stability MAE (secondary, development): {mae_mean:.4f}",
     ]
     if rkf_mae is not None:
-        metrics_text.append(fr'$RKfold \; MAE: {rkf_mae:.4f}$')
+        metrics_text.append(
+            f"Internal CV MAE (secondary, development): {rkf_mae:.4f}"
+        )
     if rkf_r2 is not None:
-        metrics_text.append(fr'$RKfold \; R^2: {rkf_r2:.4f}$')
+        metrics_text.append(
+            f"Internal CV R² (secondary, development): {rkf_r2:.4f}"
+        )
+    if r2_loo is not None:
+        metrics_text.append(
+            f"LOOCV R² (secondary, development): {r2_loo:.4f}"
+        )
 
     for i, text in enumerate(metrics_text):
         y_pos = ymin + i * y_spacing + y_range * 0.1
@@ -175,19 +190,36 @@ def add_plot_labels(metrics, mae_mean, model_name, r2_loo, rkf_mae=None, rkf_r2=
     plt.subplots_adjust(right=0.85)
 
 def add_plot_labels_standard(metrics, mae_mean, model_name, r2_loo, fontsize=20, fontname='DejaVu Sans', rkf_mae=None, rkf_r2=None):
-    """Add evaluation metrics text (publication-quality, relative-axis coordinates)."""
-    plt.text(0.95, 0.05, fr"$Pearson \; R_{{train}}: {metrics['r_train']:.4f}$", fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    plt.text(0.95, 0.19, fr"$RMSE_{{test}}: {metrics['rmse_test']:.4f}$", fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    plt.text(0.95, 0.12, fr"$Pearson \; R_{{test}}: {metrics['r_test']:.4f}$", fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    plt.text(0.95, 0.26, fr"$MAE_{{test}}: {metrics['mae_test']:.4f}$", fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    plt.text(0.95, 0.33, fr'$MAE_{{mean}}: {mae_mean:.4f}$', fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    plt.text(0.95, 0.4, fr'$R^2_{{LOO}}: {r2_loo:.4f}$', fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-    row = 0.47
+    """Add publication labels using the primary/secondary evaluation protocol."""
+    labels = [
+        f"Development Pearson R (secondary): {metrics['r_train']:.4f}",
+        f"Final Test Pearson R (PRIMARY): {metrics['r_test']:.4f}",
+        f"Final Test RMSE (PRIMARY): {metrics['rmse_test']:.4f}",
+        f"Final Test MAE (PRIMARY): {metrics['mae_test']:.4f}",
+        f"Stability MAE (secondary, development): {mae_mean:.4f}",
+    ]
+    if r2_loo is not None:
+        labels.append(f"LOOCV R² (secondary, development): {r2_loo:.4f}")
     if rkf_mae is not None:
-        plt.text(0.95, row, fr'$RKfold \; MAE: {rkf_mae:.4f}$', fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
-        row += 0.07
+        labels.append(
+            f"Internal CV MAE (secondary, development): {rkf_mae:.4f}"
+        )
     if rkf_r2 is not None:
-        plt.text(0.95, row, fr'$RKfold \; R^2: {rkf_r2:.4f}$', fontsize=fontsize-5, ha='right', va='bottom', fontname='DejaVu Sans', transform=plt.gca().transAxes)
+        labels.append(
+            f"Internal CV R² (secondary, development): {rkf_r2:.4f}"
+        )
+
+    for row, label in enumerate(labels):
+        plt.text(
+            0.95,
+            0.05 + row * 0.07,
+            label,
+            fontsize=fontsize - 5,
+            ha='right',
+            va='bottom',
+            fontname='DejaVu Sans',
+            transform=plt.gca().transAxes,
+        )
 
 def plot_scatter_standard(y_train, y_pred_train, y_test, y_pred_test, model_name, mae_mean, output_dir, output_name, 
                X_train=None, X_test=None,r2_loo=None,fontsize=20,fontname='DejaVu Sans'):
