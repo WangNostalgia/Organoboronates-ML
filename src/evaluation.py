@@ -1,7 +1,7 @@
 """
-Unified evaluation center (Single Source of Truth for 5脳5 RepeatedKFold).
+Unified evaluation center (Single Source of Truth for 5×5 RepeatedKFold).
 
-All modules that need a rigorous, leakage-free 5脳5 RepeatedKFold evaluation
+All modules that need a rigorous, leakage-free 5×5 RepeatedKFold evaluation
 MUST call repeated_kfold_evaluate() from here.  This eliminates code duplication
 and ensures consistent per-fold scaling + inverse-transform to kcal/mol.
 
@@ -47,7 +47,7 @@ def repeated_kfold_evaluate(model, X, y, n_splits=5, n_repeats=5, random_state=4
     X : DataFrame or array, feature matrix (unscaled)
     y : Series or array, target vector
     n_splits : int, number of folds (default 5)
-    n_repeats : int, number of repeats (default 5 -> 25 total evaluations)
+    n_repeats : int, number of repeats (default 5 → 25 total evaluations)
     random_state : int
     splits : iterable of (train_idx, test_idx) or None
         Optional precomputed splits to reuse as-is.
@@ -75,10 +75,12 @@ def repeated_kfold_evaluate(model, X, y, n_splits=5, n_repeats=5, random_state=4
         X_tr_raw, X_te_raw = X_arr[train_idx], X_arr[test_idx]
         y_tr_orig, y_te_orig = y_orig[train_idx], y_orig[test_idx]
 
+        # Per-fold feature scaling — fit ONLY on this fold's training data
         fold_sX = MinMaxScaler()
         X_tr = fold_sX.fit_transform(X_tr_raw)
         X_te = fold_sX.transform(X_te_raw)
 
+        # Per-fold target scaling
         fold_sY = MinMaxScaler(feature_range=(0, 100))
         y_tr_s = fold_sY.fit_transform(y_tr_orig.reshape(-1, 1)).ravel()
 
@@ -86,6 +88,7 @@ def repeated_kfold_evaluate(model, X, y, n_splits=5, n_repeats=5, random_state=4
         m.fit(X_tr, y_tr_s)
 
         y_pred_s = m.predict(X_te)
+        # Inverse-transform to original kcal/mol scale BEFORE computing MAE
         y_pred_orig = fold_sY.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
 
         mae_scores.append(mean_absolute_error(y_te_orig, y_pred_orig))
@@ -97,6 +100,7 @@ def repeated_kfold_evaluate(model, X, y, n_splits=5, n_repeats=5, random_state=4
         'rkf_r2_mean': float(np.mean(r2_scores)),
         'rkf_r2_std': float(np.std(r2_scores)),
         'n_evals': len(mae_scores),
+        # y_randomization compatible aliases
         'mae_mean': float(np.mean(mae_scores)),
         'mae_std': float(np.std(mae_scores)),
         'r2_mean': float(np.mean(r2_scores)),

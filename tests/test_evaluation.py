@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
@@ -29,6 +30,13 @@ class RecordingZeroRegressor(BaseEstimator, RegressorMixin):
 class RepeatedKFoldEvaluationTests(unittest.TestCase):
     def setUp(self):
         RecordingZeroRegressor.fit_records = []
+
+    def test_evaluation_source_preserves_original_unicode_text(self):
+        source = Path("src/evaluation.py").read_text(encoding="utf-8")
+
+        self.assertIn("Unified evaluation center (Single Source of Truth for 5×5 RepeatedKFold).", source)
+        self.assertIn("All modules that need a rigorous, leakage-free 5×5 RepeatedKFold evaluation", source)
+        self.assertIn("n_repeats : int, number of repeats (default 5 → 25 total evaluations)", source)
 
     def test_make_repeated_kfold_splits_matches_sklearn(self):
         X = np.arange(16, dtype=float).reshape(8, 2)

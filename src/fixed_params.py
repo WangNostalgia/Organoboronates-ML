@@ -9,7 +9,7 @@ get_fixed_params() and merge the result with Optuna-selected best_params:
     model = model_class(**final_params)
 
 This guarantees that the deployed model uses the EXACT same configuration
-that was evaluated during hyperparameter tuning 鈥?no missing constants.
+that was evaluated during hyperparameter tuning — no missing constants.
 """
 
 from sklearn.ensemble import AdaBoostRegressor, GradientBoostingRegressor, RandomForestRegressor
@@ -57,11 +57,14 @@ def get_fixed_params(model_class, n_jobs=-1):
 
     Returns
     -------
-    dict : fixed parameter names 鈫?values (empty dict if model not in map)
+    dict : fixed parameter names → values (empty dict if model not in map)
     """
+    # NOTE: This dict is defined inside the function (not at module level)
+    # because several entries reference the runtime `n_jobs` parameter.
+    # The dict is small (<20 entries) so the recreation cost is negligible.
     FIXED_PARAMS_MAP = {
         LinearRegression: {},
-        Ridge: {},
+        Ridge: {},  # RidgeCV handles alpha internally
         Lasso: {"max_iter": 10000, "selection": "cyclic", "random_state": 42},
         ElasticNet: {
             "max_iter": 50000, "selection": "cyclic", "random_state": 42,
@@ -77,10 +80,14 @@ def get_fixed_params(model_class, n_jobs=-1):
             "learning_rate": "adaptive", "max_iter": 5000, "early_stopping": True,
             "validation_fraction": 0.2, "n_iter_no_change": 20, "tol": 1e-3,
             "random_state": 42, "solver": "adam", "batch_size": "auto",
+            # max_iter raised from 2000 to 5000: sklearn default (200) was
+            # occasionally reached during Optuna trials even with 2000,
+            # triggering "ConvergenceWarning: Maximum iterations (200)
+            # reached".  5000 gives ample headroom for all trials.
         },
         AdaBoostRegressor: {"random_state": 42},
         KNeighborsRegressor: {"n_jobs": n_jobs},
-        GaussianProcessRegressor: {"random_state": 42, "n_restarts_optimizer": 5},
+        GaussianProcessRegressor: {"random_state": 42, "n_restarts_optimizer": 5},  # multiple restarts help escape local optima in marginal likelihood
         KernelRidge: {},
     }
 
@@ -90,17 +97,17 @@ def get_fixed_params(model_class, n_jobs=-1):
             "grow_policy": "depthwise", "base_score": 0.5,
         }
     if LGBMRegressor is not None:
-        FIXED_PARAMS_MAP[LGBMRegressor] = {"n_jobs": n_jobs, "random_state": 42, "verbose": -1}
+        FIXED_PARAMS_MAP[LGBMRegressor] = {"n_jobs": n_jobs, "random_state": 42, "verbose": -1}  # -1 suppresses per-tree split warnings
     if CatBoostRegressor is not None:
         FIXED_PARAMS_MAP[CatBoostRegressor] = {"random_state": 42, "verbose": 0}
     if GPLearnRegressor is not None:
         FIXED_PARAMS_MAP[GPLearnRegressor] = {
-            "n_jobs": 1,
-            "random_state": 42,
-            "p_crossover": 0.7,
-            "p_subtree_mutation": 0.1,
-            "p_hoist_mutation": 0.05,
-            "p_point_mutation": 0.1,
+            "n_jobs": 1,  # single-process to avoid nested parallelism with Optuna
+            "random_state": 42,  # lock GP random seed — essential for reproducible formula discovery
+            "p_crossover": 0.7,  # explicit crossover probability (must sum ≤1.0 with mutation probs)
+            "p_subtree_mutation": 0.1,  # subtree mutation probability
+            "p_hoist_mutation": 0.05,  # hoist mutation probability
+            "p_point_mutation": 0.1,  # point mutation probability
             "function_set": ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv'),
         }
 
