@@ -372,6 +372,14 @@ def iterative_optimization(
     final-test partition is transformed and scored exactly once per model,
     after the feature set and complete estimator configuration are fixed.
     """
+    if force_n_features is not None and any(
+        model_class == GPLearnRegressor for model_class in models.values()
+    ):
+        raise ValueError(
+            "GPlearn cannot use force_n_features because inherent-selection "
+            "mode has no SHAP-RFECV path to force."
+        )
+
     if min_features < 1:
         raise ValueError("min_features must be at least 1")
 
@@ -401,11 +409,6 @@ def iterative_optimization(
 
     for model_name, model_class in models.items():
         logger.info("Starting model: %s", model_name)
-        if model_class == GPLearnRegressor and force_n_features is not None:
-            raise ValueError(
-                "GPlearn cannot use force_n_features because inherent-selection "
-                "mode has no SHAP-RFECV path to force."
-            )
         model_dir = os.path.join(models_dir, model_name)
         os.makedirs(model_dir, exist_ok=True)
         clean_old_versions(model_dir, keep_versions)

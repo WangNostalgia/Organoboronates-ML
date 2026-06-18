@@ -453,6 +453,70 @@ class IterativeBoundaryTests(unittest.TestCase):
         tuning_mock.assert_not_called()
         dump_mock.assert_not_called()
 
+    def test_mixed_model_force_validation_is_atomic_before_all_side_effects(self):
+        X, y = make_sentinel_dataset()
+        real_split = train_test_split
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(model_class, X_arg.shape[1], n_jobs=kwargs["n_jobs"])
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            iterative_module,
+            "GPLearnRegressor",
+            FakeGPRegressor,
+        ), patch(
+            "src.iterative_optimization.os.getcwd",
+            return_value=tmpdir,
+        ) as getcwd_mock, patch(
+            "src.iterative_optimization.train_test_split",
+            wraps=real_split,
+        ) as split_mock, patch(
+            "src.iterative_optimization.setup_logger",
+            return_value=logging.getLogger("mixed-model-atomic-validation-test"),
+        ) as logger_mock, patch(
+            "src.iterative_optimization.clean_old_versions",
+        ) as clean_mock, patch(
+            "src.iterative_optimization.hyperparameter_optimization_and_training",
+            side_effect=fake_tuning,
+        ) as tuning_mock, patch(
+            "src.iterative_optimization.leave_one_out_validation",
+            return_value=(0.55, 1.25),
+        ) as loo_mock, patch(
+            "src.iterative_optimization.plot_performance_history",
+        ) as performance_plot_mock, patch(
+            "src.iterative_optimization.save_performance_history",
+        ) as history_save_mock, patch(
+            "src.iterative_optimization.plot_scatter",
+        ) as scatter_mock, patch(
+            "src.iterative_optimization.joblib.dump",
+        ) as dump_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                r"GPlearn.*force_n_features.*no SHAP-RFECV path",
+            ):
+                iterative_optimization(
+                    {"SVR": SVR, "GPlearn": FakeGPRegressor},
+                    X,
+                    y,
+                    n_trials=1,
+                    n_jobs=1,
+                    min_features=3,
+                    force_n_features=3,
+                )
+
+            self.assertFalse((Path(tmpdir) / "models").exists())
+
+        getcwd_mock.assert_not_called()
+        split_mock.assert_not_called()
+        logger_mock.assert_not_called()
+        clean_mock.assert_not_called()
+        tuning_mock.assert_not_called()
+        loo_mock.assert_not_called()
+        performance_plot_mock.assert_not_called()
+        history_save_mock.assert_not_called()
+        scatter_mock.assert_not_called()
+        dump_mock.assert_not_called()
+
     def test_iteration_checkpoints_cover_complete_three_to_two_feature_path(self):
         X, y = make_sentinel_dataset()
         saved_payloads = {}
