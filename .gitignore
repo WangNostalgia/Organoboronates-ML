@@ -8,6 +8,7 @@ build/
 
 # Virtual environment
 .venv/
+.worktrees/
 
 # Model outputs (large binary files)
 models/
