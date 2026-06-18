@@ -7,7 +7,7 @@ on completely independent, unseen data (external validation).
 
 Key capabilities:
   - List all trained models with their metrics and feature counts
-  - Load any final model by name and (optionally) desired feature count
+  - Load final or iteration checkpoints by name and desired feature count
   - Align external CSV columns to the model's expected feature set
   - Predict activation energies on new data
   - Calculate MAE, R², RMSE when ground-truth `activation_energy` is present
@@ -143,15 +143,12 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str,
+def _load_model_impl(model_name: str,
                n_features: int = None,
-               models_dir: str = DEFAULT_MODELS_DIR) -> dict:
+               models_dir: str = DEFAULT_MODELS_DIR,
+               allow_closest: bool = False) -> dict:
     """
-    Load a trained final model by name and optional feature count.
-
-    If multiple final versions exist for the same model, the most recent
-    (by file modification time) is returned.  When `n_features` is specified,
-    the closest-matching feature count among available versions is selected.
+    Load a trained checkpoint with deterministic category/timestamp selection.
 
     Parameters
     ----------
@@ -186,33 +183,21 @@ def load_model(model_name: str,
                 f"Model '{model_name}' not found. Available models: {available}"
             )
         model_dir = os.path.join(models_dir, candidates[0])
-        model_name = candidates[0]  # use canonical casing
+        model_name = candidates[0]
 
-    pattern = os.path.join(model_dir, '*_final_*.joblib')
-    candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    selected = _select_checkpoint(
+        model_name,
+        _discover_model_checkpoints(model_dir),
+        n_features=n_features,
+        allow_closest=allow_closest,
+    )
 
-    if not candidates:
-        raise FileNotFoundError(
-            f"No *_final_*.joblib found in {model_dir}. "
-            f"Run main.py to train this model first."
-        )
-
-    if n_features is not None:
-        # Select the version closest to the requested feature count;
-        # ties broken by recency (already sorted by mtime desc).
-        def _dist(filepath):
-            try:
-                info = joblib.load(filepath)
-                return abs(info.get('optimal_n_features',
-                                    len(info.get('features', []))) - n_features)
-            except Exception:
-                return float('inf')
-
-        candidates.sort(key=_dist)  # stable sort preserves mtime ordering
-
-    best_path = candidates[0]
-    model_info = joblib.load(best_path)
+    best_path = selected['path']
+    model_info = dict(selected['model_info'])
     model_info['_loaded_from'] = best_path
+    model_info['_checkpoint_type'] = selected['checkpoint_type']
+    model_info['_requested_n_features'] = n_features
+    model_info['_actual_n_features'] = selected['actual_n_features']
 
     # Validate required keys
     required = ['model', 'scaler_X', 'scaler_y', 'features']
@@ -225,7 +210,7 @@ def load_model(model_name: str,
 
     logger.info("Loaded %s from %s (%d features: %s)",
                 model_name, os.path.basename(best_path),
-                len(model_info['features']),
+                model_info['_actual_n_features'],
                 ', '.join(model_info['features']))
 
     return model_info
@@ -555,7 +540,7 @@ def _write_summary(summary_path, model_name, model_info, features_used,
 # Ensemble external validation
 # ---------------------------------------------------------------------------
 
-def ensemble_validation(ensemble_csv,
+def _ensemble_validation_legacy(ensemble_csv,
                         external_data,
                         target_col=DEFAULT_TARGET_COL,
                         output_dir=DEFAULT_OUTPUT_DIR,
@@ -826,8 +811,8 @@ def ensemble_validation(ensemble_csv,
     }
 
 
-def _write_ensemble_summary(summary_path, individual_results, ensemble_errors,
-                            labels, weight_array, mae, r2, rmse, n_samples):
+def _legacy_ensemble_summary_writer(summary_path, individual_results, ensemble_errors,
+                                    labels, weight_array, mae, r2, rmse, n_samples):
     """Write a human-readable summary of the ensemble validation run."""
     with open(summary_path, 'w', encoding='utf-8') as f:
         f.write(f"Ensemble External Validation Summary\n")
@@ -908,6 +893,9 @@ Examples:
                              '(columns: model_name, n_features). '
                              'When provided, runs ensemble validation instead '
                              'of single-model validation.')
+    parser.add_argument('--allow-closest', action='store_true',
+                        help='Allow nearest-match checkpoint loading when an '
+                             'exact feature count is unavailable.')
     parser.add_argument('--models-dir', type=str, default=DEFAULT_MODELS_DIR,
                         help=f'Directory containing trained models. '
                              f'Default: {DEFAULT_MODELS_DIR}')
@@ -948,6 +936,7 @@ Examples:
             target_col=target_col,
             output_dir=args.output_dir,
             models_dir=args.models_dir,
+            allow_closest=args.allow_closest,
         )
         # Print summary
         print(f"\n{'='*60}")
@@ -957,6 +946,7 @@ Examples:
         if results['ensemble_errors']:
             print(f"  Errors:      {len(results['ensemble_errors'])}")
         print(f"  Samples:     {results['n_samples']}")
+        print(f"  Excluded:    {results['excluded_rows']}")
         if results['mae'] is not None:
             print(f"  MAE:         {results['mae']:.4f} kcal/mol  (weighted mean)")
             print(f"  R2:          {results['r2']:.4f}  (weighted mean)")
@@ -988,6 +978,7 @@ Examples:
         args.model,
         n_features=args.n_features,
         models_dir=args.models_dir,
+        allow_closest=args.allow_closest,
     )
 
     # Determine target column
@@ -1492,7 +1483,7 @@ def _write_ensemble_summary(summary_path, individual_results, ensemble_errors,
                 f.write(f"  {name} ({nf} feat): {err}\n")
 
 
-def main():
+def _main_legacy():
     """Command-line interface for external validation."""
     parser = argparse.ArgumentParser(
         description='External Validation for Organoboronate ML Models',

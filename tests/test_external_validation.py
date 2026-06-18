@@ -72,6 +72,16 @@ class ExternalValidationTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
+    def test_source_has_single_definitions_for_key_entrypoints_and_updated_docstring(self):
+        source = Path("src/external_validation.py").read_text(encoding="utf-8")
+
+        self.assertEqual(source.count("def load_model("), 1)
+        self.assertEqual(source.count("def ensemble_validation("), 1)
+        self.assertEqual(source.count("def _write_ensemble_summary("), 1)
+        self.assertEqual(source.count("def main("), 1)
+        self.assertNotIn("Load any final model by name", source)
+        self.assertIn("Load final or iteration checkpoints", source)
+
     def test_load_model_exact_final_preferred_over_iteration(self):
         write_checkpoint(
             self.models_dir,
