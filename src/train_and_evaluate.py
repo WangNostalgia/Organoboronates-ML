@@ -96,7 +96,6 @@ def _select_alpha_via_inner_cv(
     model_class,
     X,
     y,
-    base_params,
     tuned_params=None,
     candidate_alphas=None,
     random_state=42,
@@ -338,7 +337,6 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
             Ridge,
             X,
             y,
-            base_params=get_fixed_params(Ridge, n_jobs),
             random_state=random_state,
             n_jobs=n_jobs,
         )
@@ -352,7 +350,6 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
                     Lasso,
                     X,
                     y,
-                    base_params=get_fixed_params(Lasso, n_jobs),
                     tuned_params=tuned_params,
                     random_state=random_state,
                     n_jobs=n_jobs,
@@ -396,7 +393,7 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
         stability["mae_std"],
     )
     logger.info(
-        "5x5 RepeatedKFold: MAE = %.4f ± %.4f | R² = %.4f ± %.4f (%d evaluations)",
+        "5×5 RepeatedKFold: MAE = %.4f ± %.4f | R² = %.4f ± %.4f (%d evaluations)",
         internal_cv["rkf_mae_mean"],
         internal_cv["rkf_mae_std"],
         internal_cv["rkf_r2_mean"],

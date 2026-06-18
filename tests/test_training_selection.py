@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import patch
 import sys
 import types
+import inspect
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -170,6 +172,20 @@ class RecordingMinMaxScaler:
 
 
 class TrainingSelectionTests(unittest.TestCase):
+    def test_train_and_evaluate_source_preserves_unicode_log_text(self):
+        source = Path("src/train_and_evaluate.py").read_text(encoding="utf-8")
+
+        self.assertIn("5×5 RepeatedKFold: MAE = %.4f ± %.4f | R² = %.4f ± %.4f (%d evaluations)", source)
+        self.assertIn('"100-split stability MAE: %.4f ± %.4f"', source)
+        self.assertNotIn("卤", source)
+        self.assertNotIn("虏", source)
+        self.assertNotIn("5x5 RepeatedKFold", source)
+
+    def test_select_alpha_helper_no_longer_exposes_unused_base_params_argument(self):
+        signature = inspect.signature(_select_alpha_via_inner_cv)
+
+        self.assertNotIn("base_params", signature.parameters)
+
     def test_ridge_alpha_selection_uses_fold_local_scaling_and_original_unit_mae(self):
         X, y = make_development_dataset()
         candidate_alphas = np.array([0.1, 1.0])
@@ -188,7 +204,6 @@ class TrainingSelectionTests(unittest.TestCase):
                 Ridge,
                 X,
                 y,
-                base_params={},
                 candidate_alphas=candidate_alphas,
                 random_state=7,
                 inner_splits=2,
@@ -227,7 +242,6 @@ class TrainingSelectionTests(unittest.TestCase):
                 Lasso,
                 X,
                 y,
-                base_params=lasso_params,
                 tuned_params={"tol": 1e-4},
                 candidate_alphas=candidate_alphas,
                 random_state=11,
@@ -287,6 +301,50 @@ class TrainingSelectionTests(unittest.TestCase):
 
         with self.assertRaises(NotFittedError):
             check_is_fitted(artifacts["estimator"])
+
+    def test_ridge_selected_alpha_is_carried_into_estimator_and_complete_params(self):
+        X, y = make_development_dataset()
+
+        with patch("src.train_and_evaluate._select_alpha_via_inner_cv", return_value=(0.25, 1.5)), patch(
+            "src.train_and_evaluate._stability_analysis",
+            return_value={"mae_mean": 1.0, "mae_std": 0.1, "n_splits": 100},
+        ), patch(
+            "src.train_and_evaluate.repeated_kfold_evaluate",
+            return_value={"rkf_mae_mean": 1.2, "rkf_mae_std": 0.2, "rkf_r2_mean": 0.3, "rkf_r2_std": 0.4, "n_evals": 25},
+        ):
+            artifacts = train_and_evaluate(
+                Ridge,
+                X,
+                y,
+                random_state=13,
+                n_trials=1,
+                n_jobs=1,
+            )
+
+        self.assertEqual(artifacts["complete_params"]["alpha"], 0.25)
+        self.assertEqual(artifacts["estimator"].get_params(deep=False)["alpha"], 0.25)
+
+    def test_lasso_selected_alpha_is_carried_into_estimator_and_complete_params(self):
+        X, y = make_development_dataset()
+
+        with patch("src.train_and_evaluate._select_alpha_via_inner_cv", return_value=(0.125, 1.75)), patch(
+            "src.train_and_evaluate._stability_analysis",
+            return_value={"mae_mean": 1.0, "mae_std": 0.1, "n_splits": 100},
+        ), patch(
+            "src.train_and_evaluate.repeated_kfold_evaluate",
+            return_value={"rkf_mae_mean": 1.2, "rkf_mae_std": 0.2, "rkf_r2_mean": 0.3, "rkf_r2_std": 0.4, "n_evals": 25},
+        ):
+            artifacts = train_and_evaluate(
+                Lasso,
+                X,
+                y,
+                random_state=13,
+                n_trials=1,
+                n_jobs=1,
+            )
+
+        self.assertEqual(artifacts["complete_params"]["alpha"], 0.125)
+        self.assertEqual(artifacts["estimator"].get_params(deep=False)["alpha"], 0.125)
 
     def test_hyperparameter_optimization_and_training_returns_unfitted_complete_estimator_without_splits(self):
         X, y = make_development_dataset()
