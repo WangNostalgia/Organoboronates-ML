@@ -37,6 +37,7 @@ Usage (Python API):
 
 import os
 import glob
+import re
 import argparse
 import logging
 import warnings
@@ -1018,6 +1019,630 @@ Examples:
     for fp in results['output_files']:
         print(f"    - {fp}")
     print(f"{'='*60}\n")
+
+    return results
+
+
+def _checkpoint_timestamp_from_path(filepath: str) -> str:
+    """Extract the trailing YYYYMMDD_HHMMSS timestamp from a checkpoint filename."""
+    match = re.search(r'(\d{8}_\d{6})\.joblib$', os.path.basename(filepath))
+    if not match:
+        raise ValueError(
+            f"Checkpoint filename does not end with a YYYYMMDD_HHMMSS timestamp: {filepath}"
+        )
+    return match.group(1)
+
+
+def _checkpoint_type_from_path(filepath: str) -> str:
+    """Infer checkpoint category from its filename."""
+    filename = os.path.basename(filepath)
+    if '_final_' in filename:
+        return 'final'
+    if '_iteration_' in filename:
+        return 'iteration'
+    raise ValueError(f"Unrecognised checkpoint filename format: {filepath}")
+
+
+def _loaded_feature_count(model_info: dict) -> int:
+    """Return the saved feature count, falling back to the feature-list length."""
+    return int(model_info.get('optimal_n_features', len(model_info.get('features', []))))
+
+
+def _discover_model_checkpoints(model_dir: str):
+    """Load checkpoint metadata for deterministic selection."""
+    checkpoints = []
+    for pattern in (
+        os.path.join(model_dir, '*_final_*.joblib'),
+        os.path.join(model_dir, '*_iteration_*.joblib'),
+    ):
+        for path in sorted(glob.glob(pattern)):
+            info = joblib.load(path)
+            checkpoints.append({
+                'path': path,
+                'checkpoint_type': _checkpoint_type_from_path(path),
+                'timestamp': _checkpoint_timestamp_from_path(path),
+                'actual_n_features': _loaded_feature_count(info),
+                'model_info': info,
+            })
+    return checkpoints
+
+
+def _raise_checkpoint_ambiguity(model_name: str, candidates, reason: str):
+    """Raise a consistent ambiguity error with the colliding filenames."""
+    details = ', '.join(os.path.basename(candidate['path']) for candidate in candidates)
+    raise ValueError(
+        f"Ambiguous checkpoint selection for '{model_name}' ({reason}): {details}"
+    )
+
+
+def _select_checkpoint(model_name: str,
+                       checkpoints,
+                       n_features: int = None,
+                       allow_closest: bool = False):
+    """Select one checkpoint deterministically according to the task rules."""
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"No final or iteration checkpoints found for model '{model_name}'. "
+            f"Run main.py to train this model first."
+        )
+
+    if n_features is not None:
+        requested_n_features = int(n_features)
+        exact_matches = [
+            checkpoint for checkpoint in checkpoints
+            if checkpoint['actual_n_features'] == requested_n_features
+        ]
+        if exact_matches:
+            preferred_type = 'final' if any(
+                checkpoint['checkpoint_type'] == 'final' for checkpoint in exact_matches
+            ) else 'iteration'
+            same_type = [
+                checkpoint for checkpoint in exact_matches
+                if checkpoint['checkpoint_type'] == preferred_type
+            ]
+            latest_timestamp = max(checkpoint['timestamp'] for checkpoint in same_type)
+            finalists = [
+                checkpoint for checkpoint in same_type
+                if checkpoint['timestamp'] == latest_timestamp
+            ]
+            if len(finalists) > 1:
+                _raise_checkpoint_ambiguity(
+                    model_name,
+                    finalists,
+                    f"multiple {preferred_type} checkpoints at {latest_timestamp} "
+                    f"with {requested_n_features} features",
+                )
+            return finalists[0]
+
+        available_counts = sorted({
+            checkpoint['actual_n_features'] for checkpoint in checkpoints
+        })
+        if not allow_closest:
+            raise ValueError(
+                f"No exact checkpoint found for model '{model_name}' with "
+                f"{requested_n_features} features. Available feature counts: "
+                f"{available_counts}. Re-run with allow_closest=True (or "
+                f"--allow-closest in CLI) to permit nearest-match loading."
+            )
+
+        ranked = sorted(
+            checkpoints,
+            key=lambda checkpoint: (
+                abs(checkpoint['actual_n_features'] - requested_n_features),
+                0 if checkpoint['checkpoint_type'] == 'final' else 1,
+                -int(checkpoint['timestamp'].replace('_', '')),
+            ),
+        )
+        best_rank = (
+            abs(ranked[0]['actual_n_features'] - requested_n_features),
+            0 if ranked[0]['checkpoint_type'] == 'final' else 1,
+            ranked[0]['timestamp'],
+        )
+        finalists = [
+            checkpoint for checkpoint in ranked
+            if (
+                abs(checkpoint['actual_n_features'] - requested_n_features),
+                0 if checkpoint['checkpoint_type'] == 'final' else 1,
+                checkpoint['timestamp'],
+            ) == best_rank
+        ]
+        if len(finalists) > 1:
+            _raise_checkpoint_ambiguity(
+                model_name,
+                finalists,
+                f"nearest-match tie for requested {requested_n_features} features",
+            )
+        return finalists[0]
+
+    preferred_type = 'final' if any(
+        checkpoint['checkpoint_type'] == 'final' for checkpoint in checkpoints
+    ) else 'iteration'
+    same_type = [
+        checkpoint for checkpoint in checkpoints
+        if checkpoint['checkpoint_type'] == preferred_type
+    ]
+    latest_timestamp = max(checkpoint['timestamp'] for checkpoint in same_type)
+    finalists = [
+        checkpoint for checkpoint in same_type
+        if checkpoint['timestamp'] == latest_timestamp
+    ]
+    if len(finalists) > 1:
+        _raise_checkpoint_ambiguity(
+            model_name,
+            finalists,
+            f"multiple {preferred_type} checkpoints at {latest_timestamp}",
+        )
+    return finalists[0]
+
+
+def load_model(model_name: str,
+               n_features: int = None,
+               models_dir: str = DEFAULT_MODELS_DIR,
+               allow_closest: bool = False) -> dict:
+    """Load a trained checkpoint with deterministic category/timestamp selection."""
+    model_dir = os.path.join(models_dir, model_name)
+    if not os.path.isdir(model_dir):
+        candidates = [
+            d for d in os.listdir(models_dir)
+            if d.lower() == model_name.lower()
+            and os.path.isdir(os.path.join(models_dir, d))
+        ]
+        if not candidates:
+            available = ', '.join(
+                d for d in os.listdir(models_dir)
+                if os.path.isdir(os.path.join(models_dir, d))
+            )
+            raise FileNotFoundError(
+                f"Model '{model_name}' not found. Available models: {available}"
+            )
+        model_dir = os.path.join(models_dir, candidates[0])
+        model_name = candidates[0]
+
+    selected = _select_checkpoint(
+        model_name,
+        _discover_model_checkpoints(model_dir),
+        n_features=n_features,
+        allow_closest=allow_closest,
+    )
+
+    best_path = selected['path']
+    model_info = dict(selected['model_info'])
+    model_info['_loaded_from'] = best_path
+    model_info['_checkpoint_type'] = selected['checkpoint_type']
+    model_info['_requested_n_features'] = n_features
+    model_info['_actual_n_features'] = selected['actual_n_features']
+
+    required = ['model', 'scaler_X', 'scaler_y', 'features']
+    missing = [k for k in required if k not in model_info]
+    if missing:
+        raise KeyError(
+            f"Model file {best_path} is missing required keys: {missing}. "
+            f"Available keys: {list(model_info.keys())}"
+        )
+
+    logger.info("Loaded %s from %s (%d features: %s)",
+                model_name, os.path.basename(best_path),
+                model_info['_actual_n_features'],
+                ', '.join(model_info['features']))
+
+    return model_info
+
+
+def ensemble_validation(ensemble_csv,
+                        external_data,
+                        target_col=DEFAULT_TARGET_COL,
+                        output_dir=DEFAULT_OUTPUT_DIR,
+                        models_dir=DEFAULT_MODELS_DIR,
+                        allow_closest=False):
+    """
+    Run deterministic external validation for a CSV-defined ensemble.
+
+    Each member predicts on its own NaN-filtered subset, but aggregation is
+    performed only on the common original row index shared by all members.
+    """
+    spec = pd.read_csv(ensemble_csv)
+    required_cols = {'model_name', 'n_features'}
+    missing_cols = required_cols - set(spec.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Ensemble CSV must contain columns: {required_cols}. "
+            f"Missing: {missing_cols}. Found: {list(spec.columns)}"
+        )
+    spec = spec.dropna(subset=['model_name', 'n_features'])
+    spec['n_features'] = spec['n_features'].astype(int)
+
+    logger.info("Ensemble specification: %d models from %s",
+                len(spec), ensemble_csv)
+    for _, row in spec.iterrows():
+        logger.info("  - %s (%d features)", row['model_name'], row['n_features'])
+
+    if isinstance(external_data, str):
+        df_external = pd.read_csv(external_data)
+        logger.info("Loaded external data from %s (%d rows)", external_data, len(df_external))
+    elif isinstance(external_data, pd.DataFrame):
+        df_external = external_data.copy()
+    else:
+        raise TypeError(f"external_data must be str or DataFrame, got {type(external_data).__name__}")
+
+    unnamed_cols = [c for c in df_external.columns if 'Unnamed' in str(c)]
+    if unnamed_cols:
+        df_external = df_external.drop(columns=unnamed_cols)
+        logger.info("Dropped %d unnamed column(s)", len(unnamed_cols))
+
+    df_external = df_external.rename(columns=_normalise_column_name)
+
+    all_predictions = {}
+    model_weights = {}
+    individual_results = []
+    ensemble_members = []
+    ensemble_errors = []
+
+    for _, row in spec.iterrows():
+        model_name = row['model_name']
+        requested_n_features = int(row['n_features'])
+        requested_label = f"{model_name} ({requested_n_features} feat)"
+
+        try:
+            model_info = load_model(
+                model_name,
+                n_features=requested_n_features,
+                models_dir=models_dir,
+                allow_closest=allow_closest,
+            )
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", requested_label, exc)
+            ensemble_errors.append((model_name, requested_n_features, str(exc)))
+            continue
+
+        model = model_info['model']
+        scaler_X = model_info['scaler_X']
+        scaler_y = model_info['scaler_y']
+        expected_features = model_info['features']
+        actual_n_features = model_info['_actual_n_features']
+        label = f"{model_name} ({actual_n_features} feat)"
+
+        missing = [f for f in expected_features if f not in df_external.columns]
+        if missing:
+            logger.warning("Skipping %s - missing features: %s", label, missing)
+            ensemble_errors.append(
+                (model_name, requested_n_features, f"Missing features: {missing}")
+            )
+            continue
+
+        X_ext = df_external[expected_features].copy()
+        nan_mask = X_ext.isna().any(axis=1)
+        valid_index = X_ext.index[~nan_mask]
+        if nan_mask.any():
+            logger.warning("%s: dropping %d NaN row(s)", label, nan_mask.sum())
+        X_valid = X_ext.loc[valid_index]
+
+        X_scaled = scaler_X.transform(X_valid)
+        y_pred_scaled = model.predict(X_scaled)
+        y_pred = scaler_y.inverse_transform(
+            y_pred_scaled.reshape(-1, 1)
+        ).ravel()
+
+        prediction_series = pd.Series(y_pred, index=valid_index, name=label)
+        all_predictions[label] = prediction_series
+        ensemble_members.append((model_name, actual_n_features))
+
+        metrics = model_info.get('metrics', {})
+        rkf_mae = metrics.get('rkf_mae_opt_mean')
+        if rkf_mae is None or rkf_mae <= 0:
+            rkf_mae = metrics.get('mae_mean', 2.0)
+        model_weights[label] = 1.0 / (rkf_mae ** 2)
+
+        individual_results.append({
+            'model_name': model_name,
+            'n_features': actual_n_features,
+            'label': label,
+            'features': expected_features,
+            'mae': None,
+            'r2': None,
+            'rmse': None,
+            'weight': model_weights[label],
+        })
+        logger.info("%s: prediction complete", label)
+
+    if not all_predictions:
+        raise RuntimeError(
+            f"No ensemble members loaded successfully. "
+            f"Errors: {ensemble_errors}"
+        )
+
+    prediction_frame = pd.concat(all_predictions.values(), axis=1, join='inner').dropna(how='any')
+    if prediction_frame.empty:
+        raise RuntimeError(
+            "No common complete rows remain after aligning ensemble member predictions."
+        )
+
+    labels = list(prediction_frame.columns)
+    weight_array = np.array([model_weights[label] for label in labels], dtype=float)
+    weight_array = weight_array / weight_array.sum()
+    y_pred_mean = prediction_frame.mean(axis=1)
+    y_pred_weighted = prediction_frame.dot(weight_array)
+    excluded_rows = len(df_external) - len(prediction_frame)
+
+    logger.info("Ensemble aggregation: %d members, %d aligned predictions",
+                len(labels), len(prediction_frame))
+    logger.info("Weights (normalised): %s",
+                {label: f"{weight:.3f}" for label, weight in zip(labels, weight_array)})
+
+    id_cols = [c for c in ['sub_H', 'sub_B'] if c in df_external.columns]
+    results_df = df_external.loc[prediction_frame.index, id_cols].copy()
+    for label in labels:
+        safe_label = label.replace(' ', '_').replace('(', '').replace(')', '')
+        results_df[f'pred_{safe_label}'] = prediction_frame[label]
+
+    results_df['predicted_activation_energy'] = y_pred_weighted
+    results_df['predicted_mean'] = y_pred_mean
+    results_df['predicted_weighted'] = y_pred_weighted
+
+    mae = r2 = rmse = None
+    has_gt = (target_col is not None and target_col in df_external.columns)
+    if has_gt:
+        y_true = df_external.loc[prediction_frame.index, target_col]
+        valid = ~y_true.isna()
+        if valid.any():
+            y_true_valid = y_true.loc[valid]
+            y_pred_weighted_valid = y_pred_weighted.loc[valid]
+            mae = float(mean_absolute_error(y_true_valid, y_pred_weighted_valid))
+            r2 = float(r2_score(y_true_valid, y_pred_weighted_valid))
+            rmse = float(np.sqrt(mean_squared_error(y_true_valid, y_pred_weighted_valid)))
+            results_df[target_col] = y_true
+            results_df['absolute_error_weighted'] = np.abs(y_pred_weighted - y_true)
+
+            for result in individual_results:
+                preds = prediction_frame.loc[valid, result['label']]
+                result['mae'] = float(mean_absolute_error(y_true_valid, preds))
+                result['r2'] = float(r2_score(y_true_valid, preds))
+                result['rmse'] = float(np.sqrt(mean_squared_error(y_true_valid, preds)))
+
+            logger.info(
+                "Ensemble weighted-mean metrics:\n"
+                "  MAE  = %.4f kcal/mol\n"
+                "  R²   = %.4f\n"
+                "  RMSE = %.4f kcal/mol",
+                mae, r2, rmse
+            )
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_files = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    preds_path = os.path.join(output_dir, f"ensemble_validation_{timestamp}.csv")
+    results_df.to_csv(preds_path, index=False, encoding='utf-8-sig')
+    output_files.append(preds_path)
+    logger.info("Ensemble predictions saved to: %s", preds_path)
+
+    if has_gt and mae is not None:
+        plot_path = os.path.join(output_dir, f"ensemble_scatter_{timestamp}.png")
+        _plot_external_scatter(
+            y_true=y_true_valid,
+            y_pred=y_pred_weighted_valid,
+            model_name=f"Ensemble ({len(labels)} models)",
+            n_features=sum(len(result['features']) for result in individual_results),
+            mae=mae, r2=r2, rmse=rmse,
+            output_path=plot_path,
+        )
+        output_files.append(plot_path)
+
+    summary_path = os.path.join(output_dir, f"ensemble_summary_{timestamp}.txt")
+    _write_ensemble_summary(
+        summary_path,
+        individual_results,
+        ensemble_errors,
+        labels,
+        weight_array,
+        mae,
+        r2,
+        rmse,
+        len(prediction_frame),
+        excluded_rows,
+    )
+    output_files.append(summary_path)
+
+    return {
+        'predictions': results_df,
+        'individual_results': individual_results,
+        'mae': mae,
+        'r2': r2,
+        'rmse': rmse,
+        'n_samples': len(prediction_frame),
+        'excluded_rows': excluded_rows,
+        'ensemble_members': ensemble_members,
+        'ensemble_errors': ensemble_errors,
+        'output_files': output_files,
+    }
+
+
+def _write_ensemble_summary(summary_path, individual_results, ensemble_errors,
+                            labels, weight_array, mae, r2, rmse, n_samples,
+                            excluded_rows):
+    """Write a human-readable summary of the deterministic ensemble run."""
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write("Ensemble External Validation Summary\n")
+        f.write(f"{'=' * 55}\n")
+        f.write(f"Timestamp:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Members:    {len(labels)}\n")
+        f.write(f"Samples:    {n_samples}\n")
+        f.write(f"Excluded rows: {excluded_rows}\n")
+        f.write("\n--- Ensemble Members ---\n")
+        f.write(f"{'Model':<22} {'Feat':<6} {'Weight':<10} {'MAE':<10} {'R2':<10}\n")
+        f.write(f"{'-' * 58}\n")
+        total_weight = sum(result['weight'] for result in individual_results) or 1.0
+        for result in individual_results:
+            weight_normalised = result['weight'] / total_weight
+            mae_s = f"{result['mae']:.2f}" if result['mae'] is not None else 'N/A'
+            r2_s = f"{result['r2']:.4f}" if result['r2'] is not None else 'N/A'
+            f.write(
+                f"{result['model_name']:<22} {result['n_features']:<6} "
+                f"{weight_normalised:<10.4f} {mae_s:<10} {r2_s:<10}\n"
+            )
+        f.write("\n--- Aggregated Metrics (weighted mean) ---\n")
+        if mae is not None:
+            f.write(f"MAE:          {mae:.4f} kcal/mol\n")
+            f.write(f"R2:           {r2:.4f}\n")
+            f.write(f"RMSE:         {rmse:.4f} kcal/mol\n")
+        else:
+            f.write("Mode:         Prediction-only\n")
+        if ensemble_errors:
+            f.write("\n--- Errors / Skipped Models ---\n")
+            for name, nf, err in ensemble_errors:
+                f.write(f"  {name} ({nf} feat): {err}\n")
+
+
+def main():
+    """Command-line interface for external validation."""
+    parser = argparse.ArgumentParser(
+        description='External Validation for Organoboronate ML Models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List all available trained models
+  python src/external_validation.py --list-models
+
+  # Validate SVR model on external data
+  python src/external_validation.py --model SVR --data my_external_data.csv
+
+  # Validate RandomForest with 5 features
+  python src/external_validation.py --model RandomForest --n_features 5 --data external.csv
+
+  # Prediction-only (no ground truth column)
+  python src/external_validation.py --model SVR --data new_compounds.csv --predict-only
+
+  # Ensemble external validation (CSV-driven, multiple models)
+  python src/external_validation.py --ensemble ensemble_spec.csv --data external.csv
+        """
+    )
+    parser.add_argument('--list-models', action='store_true',
+                        help='List all available trained models and exit.')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Model name to use for external validation (e.g., SVR).')
+    parser.add_argument('--n_features', type=int, default=None,
+                        help='Desired feature count for the model. '
+                             'When omitted, the newest deterministic checkpoint is used.')
+    parser.add_argument('--data', type=str, default=None,
+                        help='Path to the external CSV file with features and '
+                             '(optionally) activation_energy column.')
+    parser.add_argument('--target-col', type=str, default=DEFAULT_TARGET_COL,
+                        help=f'Name of the target column. Default: {DEFAULT_TARGET_COL}')
+    parser.add_argument('--predict-only', action='store_true',
+                        help='Force prediction-only mode (skip evaluation even '
+                             'if target column exists).')
+    parser.add_argument('--output-dir', type=str, default=DEFAULT_OUTPUT_DIR,
+                        help=f'Output directory. Default: {DEFAULT_OUTPUT_DIR}')
+    parser.add_argument('--ensemble', type=str, default=None,
+                        help='Path to a CSV file specifying ensemble members '
+                             '(columns: model_name, n_features). '
+                             'When provided, runs ensemble validation instead '
+                             'of single-model validation.')
+    parser.add_argument('--allow-closest', action='store_true',
+                        help='Allow nearest-match checkpoint loading when an exact '
+                             'feature count is unavailable.')
+    parser.add_argument('--models-dir', type=str, default=DEFAULT_MODELS_DIR,
+                        help=f'Directory containing trained models. Default: {DEFAULT_MODELS_DIR}')
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    if args.list_models:
+        models_df = list_available_models(args.models_dir)
+        print(f"\n{'=' * 90}")
+        print("  Available Trained Models")
+        print(f"{'=' * 90}")
+        print(f"  {'Model':<20} {'Feat':<5} {'RKfold MAE':<14} {'RKfold R2':<12} Features")
+        print(f"  {'-' * 86}")
+        for _, row in models_df.iterrows():
+            mae_str = f"{row['rkf_mae']:.4f}" if pd.notna(row['rkf_mae']) else 'N/A'
+            r2_str = f"{row['rkf_r2']:.4f}" if pd.notna(row['rkf_r2']) else 'N/A'
+            print(f"  {row['model_name']:<20} {row['n_features']:<5} "
+                  f"{mae_str:<14} {r2_str:<12} {row['features']}")
+        print(f"{'=' * 90}\n")
+        return
+
+    if args.ensemble:
+        if not args.data:
+            parser.error("--data is required for ensemble validation.")
+        target_col = None if args.predict_only else args.target_col
+        results = ensemble_validation(
+            ensemble_csv=args.ensemble,
+            external_data=args.data,
+            target_col=target_col,
+            output_dir=args.output_dir,
+            models_dir=args.models_dir,
+            allow_closest=args.allow_closest,
+        )
+        print(f"\n{'=' * 60}")
+        print("  Ensemble External Validation Complete")
+        print(f"{'=' * 60}")
+        print(f"  Members:     {len(results['individual_results'])}")
+        if results['ensemble_errors']:
+            print(f"  Errors:      {len(results['ensemble_errors'])}")
+        print(f"  Samples:     {results['n_samples']}")
+        print(f"  Excluded:    {results['excluded_rows']}")
+        if results['mae'] is not None:
+            print(f"  MAE:         {results['mae']:.4f} kcal/mol  (weighted mean)")
+            print(f"  R2:          {results['r2']:.4f}  (weighted mean)")
+            print(f"  RMSE:        {results['rmse']:.4f} kcal/mol  (weighted mean)")
+        else:
+            print("  Mode:        Prediction-only")
+        print("\n  Individual member performance:")
+        for result in results['individual_results']:
+            mae_s = f"{result['mae']:.2f}" if result['mae'] is not None else 'N/A'
+            print(f"    - {result['label']}: MAE={mae_s}")
+        if results['ensemble_errors']:
+            print("\n  Skipped members:")
+            for name, nf, err in results['ensemble_errors']:
+                print(f"    - {name} ({nf} feat): {err}")
+        print("\n  Output files:")
+        for fp in results['output_files']:
+            print(f"    - {fp}")
+        print(f"{'=' * 60}\n")
+        return results
+
+    if not args.model:
+        parser.error("Either --list-models, --ensemble, or --model is required.")
+    if not args.data:
+        parser.error("--data is required for external validation.")
+
+    model_info = load_model(
+        args.model,
+        n_features=args.n_features,
+        models_dir=args.models_dir,
+        allow_closest=args.allow_closest,
+    )
+
+    target_col = None if args.predict_only else args.target_col
+    results = external_validation(
+        model_info,
+        external_data=args.data,
+        target_col=target_col,
+        output_dir=args.output_dir,
+    )
+
+    print(f"\n{'=' * 60}")
+    print("  External Validation Complete")
+    print(f"{'=' * 60}")
+    print(f"  Model:       {args.model}")
+    print(f"  Features:    {results['n_features_used']} "
+          f"({', '.join(results['features_used'])})")
+    print(f"  Samples:     {results['n_samples']}")
+    if results['mae'] is not None:
+        print(f"  MAE:         {results['mae']:.4f} kcal/mol")
+        print(f"  R2:          {results['r2']:.4f}")
+        print(f"  RMSE:        {results['rmse']:.4f} kcal/mol")
+    else:
+        print("  Mode:        Prediction-only")
+    print("\n  Output files:")
+    for fp in results['output_files']:
+        print(f"    - {fp}")
+    print(f"{'=' * 60}\n")
 
     return results
 
