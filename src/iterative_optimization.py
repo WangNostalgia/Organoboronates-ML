@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from numbers import Integral
 
 import joblib
 import matplotlib
@@ -26,8 +27,19 @@ from src.visualization import plot_scatter
 plt.rcParams["font.family"] = "DejaVu Sans"
 
 
+def _validate_keep_versions(keep_versions):
+    if (
+        not isinstance(keep_versions, Integral)
+        or isinstance(keep_versions, bool)
+        or keep_versions < 1
+    ):
+        raise ValueError("keep_versions must be a positive integer")
+    return int(keep_versions)
+
+
 def clean_old_versions(model_dir, keep_versions=2):
     """Keep only the newest final-model runs and matching iteration checkpoints."""
+    keep_versions = _validate_keep_versions(keep_versions)
     logger = logging.getLogger(__name__)
     model_name = os.path.basename(os.path.normpath(model_dir))
     escaped_model_name = re.escape(model_name)
@@ -55,7 +67,6 @@ def clean_old_versions(model_dir, keep_versions=2):
 
     matched_artifacts = []
     final_timestamps = set()
-    iteration_timestamps = set()
     for name in os.listdir(model_dir):
         filepath = os.path.join(model_dir, name)
         if not os.path.isfile(filepath):
@@ -68,18 +79,11 @@ def clean_old_versions(model_dir, keep_versions=2):
             matched_artifacts.append((filepath, timestamp))
             if pattern is final_pattern:
                 final_timestamps.add(timestamp)
-            elif pattern is iteration_pattern:
-                iteration_timestamps.add(timestamp)
             break
 
-    if final_timestamps:
-        retained_timestamps = set(
-            sorted(final_timestamps, reverse=True)[:keep_versions]
-        )
-    else:
-        retained_timestamps = set(
-            sorted(iteration_timestamps, reverse=True)[:keep_versions]
-        )
+    retained_timestamps = set(
+        sorted(final_timestamps, reverse=True)[:keep_versions]
+    )
 
     for filepath, timestamp in matched_artifacts:
         if timestamp in retained_timestamps:
@@ -393,6 +397,8 @@ def iterative_optimization(
     final-test partition is transformed and scored exactly once per model,
     after the feature set and complete estimator configuration are fixed.
     """
+    keep_versions = _validate_keep_versions(keep_versions)
+
     if force_n_features is not None and any(
         model_class == GPLearnRegressor for model_class in models.values()
     ):
@@ -704,15 +710,6 @@ def iterative_optimization(
         final_model_path = os.path.join(
             model_dir, f"{model_name}_final_{run_timestamp}"
         )
-        joblib.dump(final_model_info, f"{final_model_path}.joblib")
-        _write_final_metrics(
-            f"{final_model_path}_metrics.txt",
-            model_name,
-            result,
-            evaluation_protocol,
-            force_n_features,
-            final_estimator,
-        )
 
         internal_cv = result["internal_cv"]
         plot_scatter(
@@ -731,6 +728,16 @@ def iterative_optimization(
             rkf_r2=internal_cv["rkf_r2_mean"],
             precomputed_metrics=scatter_metrics,
         )
+
+        _write_final_metrics(
+            f"{final_model_path}_metrics.txt",
+            model_name,
+            result,
+            evaluation_protocol,
+            force_n_features,
+            final_estimator,
+        )
+        joblib.dump(final_model_info, f"{final_model_path}.joblib")
 
         clean_old_versions(model_dir, keep_versions)
 

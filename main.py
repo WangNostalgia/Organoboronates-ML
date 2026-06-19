@@ -23,6 +23,17 @@ DEFAULT_MODEL_NAMES = (
 )
 
 
+def positive_int(value):
+    """Parse a strictly positive integer for command-line arguments."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def configure_runtime():
     import logging
     import os
@@ -171,7 +182,7 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--keep_versions",
-        type=int,
+        type=positive_int,
         default=2,
         help="Number of versions to keep for each model",
     )

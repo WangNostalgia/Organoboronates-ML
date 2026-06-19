@@ -40,7 +40,11 @@ import glob
 import re
 import argparse
 import logging
+import pickle
+import struct
 import warnings
+import zlib
+from collections.abc import Sequence
 from datetime import datetime
 from numbers import Integral
 
@@ -680,7 +684,30 @@ def _checkpoint_type_from_path(filepath: str, model_name: str = None) -> str:
 
 def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
     """Use len(features) as truth and reject contradictory saved metadata."""
-    actual_count = len(model_info.get('features', []))
+    source = filepath if filepath else "<unknown>"
+    features = model_info.get('features')
+    if isinstance(features, (str, bytes)) or not isinstance(features, Sequence):
+        raise ValueError(
+            f"Invalid checkpoint features schema in {source}: features must "
+            "be a non-string sequence."
+        )
+    invalid_features = [
+        feature
+        for feature in features
+        if not isinstance(feature, str) or not feature.strip()
+    ]
+    if invalid_features:
+        raise ValueError(
+            f"Invalid checkpoint features schema in {source}: every feature "
+            f"must be a non-empty string; invalid values={invalid_features!r}."
+        )
+    if len(set(features)) != len(features):
+        raise ValueError(
+            f"Invalid checkpoint features schema in {source}: feature names "
+            "must be unique."
+        )
+
+    actual_count = len(features)
     metadata_count = model_info.get('optimal_n_features')
     metadata_is_valid = (
         isinstance(metadata_count, Integral)
@@ -689,7 +716,6 @@ def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
     if metadata_count is not None and (
         not metadata_is_valid or int(metadata_count) != actual_count
     ):
-        source = filepath if filepath else "<unknown>"
         raise ValueError(
             f"Invalid or inconsistent checkpoint feature metadata in {source}: "
             f"optimal_n_features={metadata_count!r}, "
@@ -758,7 +784,21 @@ def _discover_model_checkpoints(model_dir: str):
     for path in sorted(glob.glob(os.path.join(model_dir, '*.joblib'))):
         if not _checkpoint_filename_match(path, model_name):
             continue
-        info = joblib.load(path)
+        try:
+            info = joblib.load(path)
+        except (
+            EOFError,
+            pickle.UnpicklingError,
+            struct.error,
+            zlib.error,
+        ) as exc:
+            logger.warning(
+                "Skipping corrupt checkpoint %s: %s: %s",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            continue
         checkpoints.append({
             'path': path,
             'checkpoint_type': _checkpoint_type_from_path(path, model_name),

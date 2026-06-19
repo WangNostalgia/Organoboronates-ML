@@ -276,6 +276,80 @@ class ExternalValidationTests(unittest.TestCase):
                     2,
                 )
 
+    def test_loaded_feature_count_rejects_invalid_feature_schema_with_context(self):
+        filepath = str(self.models_dir / "SVR" / "SVR_final_20240101_120000.joblib")
+        invalid_features = (
+            "f1",
+            ["f1", 2],
+            ["f1", ""],
+            ["f1", "   "],
+            ["f1", "f1"],
+        )
+
+        for features in invalid_features:
+            with self.subTest(features=features):
+                with self.assertRaises(ValueError) as context:
+                    _loaded_feature_count(
+                        {"features": features},
+                        filepath=filepath,
+                    )
+
+                message = str(context.exception)
+                self.assertIn(filepath, message)
+                self.assertIn("features", message)
+
+    def test_corrupt_iteration_is_skipped_without_blocking_healthy_final(self):
+        final_path = write_checkpoint(
+            self.models_dir,
+            "SVR",
+            "final",
+            "20240101_120000",
+            ["f1", "f2"],
+            prediction=5.0,
+        )
+        corrupt_path = write_checkpoint(
+            self.models_dir,
+            "SVR",
+            "iteration",
+            "20240102_120000",
+            ["f1", "f2", "f3"],
+        )
+        corrupt_bytes = corrupt_path.read_bytes()
+        corrupt_path.write_bytes(corrupt_bytes[: len(corrupt_bytes) // 2])
+
+        with patch("src.external_validation.logger.warning") as warning_mock:
+            checkpoints = _discover_model_checkpoints(
+                str(self.models_dir / "SVR")
+            )
+
+        self.assertEqual([Path(item["path"]) for item in checkpoints], [final_path])
+        warning_mock.assert_called_once()
+        self.assertEqual(warning_mock.call_args.args[1], str(corrupt_path))
+
+        available = list_available_models(models_dir=str(self.models_dir))
+        self.assertEqual(available["model_name"].tolist(), ["SVR"])
+        model_info = load_model("SVR", models_dir=str(self.models_dir))
+        self.assertEqual(Path(model_info["_loaded_from"]), final_path)
+        self.assertEqual(model_info["model"].prediction, 5.0)
+
+    def test_all_corrupt_checkpoints_follow_normal_no_checkpoints_path(self):
+        corrupt_path = write_checkpoint(
+            self.models_dir,
+            "SVR",
+            "iteration",
+            "20240102_120000",
+            ["f1", "f2"],
+        )
+        corrupt_bytes = corrupt_path.read_bytes()
+        corrupt_path.write_bytes(corrupt_bytes[: len(corrupt_bytes) // 2])
+
+        with self.assertLogs("src.external_validation", level="WARNING"):
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                "No final or iteration checkpoints found",
+            ):
+                load_model("SVR", models_dir=str(self.models_dir))
+
     def test_checkpoint_discovery_parses_final_token_in_model_name_once(self):
         model_name = "Catalyst_final_variant"
         model_dir = self.models_dir / model_name

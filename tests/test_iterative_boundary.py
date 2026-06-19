@@ -180,6 +180,48 @@ class TaggedRegressor(BaseEstimator, RegressorMixin):
 
 
 class IterativeBoundaryTests(unittest.TestCase):
+    def test_keep_versions_rejects_invalid_values_before_any_side_effect(self):
+        X, y = make_sentinel_dataset()
+
+        for invalid_value in (0, -1, True, 1.5, "2", None):
+            with self.subTest(keep_versions=invalid_value), patch(
+                "src.iterative_optimization.train_test_split",
+            ) as split_mock, patch(
+                "src.iterative_optimization.os.getcwd",
+            ) as getcwd_mock, patch(
+                "src.iterative_optimization.setup_logger",
+            ) as logger_mock, patch(
+                "src.iterative_optimization.joblib.dump",
+            ) as dump_mock:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "keep_versions must be a positive integer",
+                ):
+                    iterative_optimization(
+                        {"SVR": SVR},
+                        X,
+                        y,
+                        keep_versions=invalid_value,
+                    )
+
+                split_mock.assert_not_called()
+                getcwd_mock.assert_not_called()
+                logger_mock.assert_not_called()
+                dump_mock.assert_not_called()
+
+    def test_clean_old_versions_defensively_rejects_invalid_keep_versions(self):
+        for invalid_value in (0, -1, True, 1.5, "2", None):
+            with self.subTest(keep_versions=invalid_value), patch(
+                "src.iterative_optimization.os.listdir",
+            ) as listdir_mock:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "keep_versions must be a positive integer",
+                ):
+                    clean_old_versions("unused-model-dir", invalid_value)
+
+                listdir_mock.assert_not_called()
+
     def test_shared_final_test_is_never_seen_by_selection_and_is_evaluated_once(self):
         X, y = make_sentinel_dataset()
         X_dev, X_final_test, y_dev, _ = train_test_split(
@@ -809,6 +851,18 @@ class IterativeBoundaryTests(unittest.TestCase):
         retained_timestamp = "20240102_120000"
         new_timestamp = "20240103_120000"
 
+        def family_names(timestamp):
+            return {
+                f"SVR_iteration_1_{timestamp}.joblib",
+                f"SVR_iteration_1_{timestamp}_metrics.txt",
+                f"SVR_final_{timestamp}.joblib",
+                f"SVR_final_{timestamp}_metrics.txt",
+                f"performance_history_{timestamp}.csv",
+                f"performance_history_{timestamp}.png",
+                f"final_scatter_{timestamp}.png",
+                f"final_scatter_{timestamp}_outliers.csv",
+            }
+
         def fake_tuning(model_class, X_arg, y_arg, **kwargs):
             return make_artifacts(
                 model_class,
@@ -820,7 +874,8 @@ class IterativeBoundaryTests(unittest.TestCase):
             model_dir = Path(tmpdir) / "models" / "SVR"
             model_dir.mkdir(parents=True)
             for timestamp in (old_timestamp, retained_timestamp):
-                (model_dir / f"SVR_final_{timestamp}.joblib").touch()
+                for name in family_names(timestamp):
+                    (model_dir / name).touch()
 
             with patch(
                 "src.iterative_optimization.os.getcwd",
@@ -858,17 +913,27 @@ class IterativeBoundaryTests(unittest.TestCase):
                         min_features=3,
                     )
 
+            names_after_failure = {path.name for path in model_dir.iterdir()}
+            self.assertTrue(family_names(old_timestamp).issubset(names_after_failure))
             self.assertTrue(
-                (model_dir / f"SVR_final_{old_timestamp}.joblib").exists()
+                family_names(retained_timestamp).issubset(names_after_failure)
             )
-            self.assertTrue(
-                (model_dir / f"SVR_final_{retained_timestamp}.joblib").exists()
-            )
-            self.assertTrue(
+            self.assertFalse(
                 (model_dir / f"SVR_final_{new_timestamp}.joblib").exists()
             )
             self.assertFalse(
+                (model_dir / f"SVR_final_{new_timestamp}_metrics.txt").exists()
+            )
+            self.assertFalse(
                 (model_dir / f"final_scatter_{new_timestamp}.png").exists()
+            )
+
+            clean_old_versions(str(model_dir), keep_versions=2)
+
+            names_after_cleanup = {path.name for path in model_dir.iterdir()}
+            self.assertEqual(
+                names_after_cleanup,
+                family_names(old_timestamp) | family_names(retained_timestamp),
             )
 
     def test_iterative_signature_and_main_parser_expose_only_current_selection_controls(self):

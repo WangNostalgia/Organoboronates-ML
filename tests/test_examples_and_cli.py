@@ -205,6 +205,27 @@ class MainCliDefinitionTests(unittest.TestCase):
             self.assertFalse((Path(tmpdir) / "models").exists())
             self.assertEqual(list(Path(tmpdir).glob("optimization_*.log")), [])
 
+    def test_main_keep_versions_rejects_zero_and_negative_atomically(self):
+        for invalid_value in ("0", "-1"):
+            with self.subTest(keep_versions=invalid_value), tempfile.TemporaryDirectory() as tmpdir:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(WORKTREE_ROOT / "main.py"),
+                        "--keep_versions",
+                        invalid_value,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=tmpdir,
+                    check=False,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("positive integer", completed.stderr)
+                self.assertFalse((Path(tmpdir) / "models").exists())
+                self.assertEqual(list(Path(tmpdir).glob("optimization_*.log")), [])
+
 
 class DependencyMetadataTests(unittest.TestCase):
     def test_dependency_files_include_default_model_packages(self):
