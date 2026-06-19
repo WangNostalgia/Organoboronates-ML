@@ -162,6 +162,7 @@ models/
 - 读取锁定后的 checkpoint
 - 让原始标签与置乱标签复用同一组预计算 5×5 RepeatedKFold splits
 - 输出修正后的有限置换 p 值 `(b + 1) / (m + 1)`
+- 将图保存为根模型目录下的 `models/y_randomization_<ModelName>.png`
 
 ### Applicability Domain
 

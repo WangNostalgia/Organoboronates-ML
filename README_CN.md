@@ -109,6 +109,7 @@ Iteration checkpoint 保留扁平 development-path 指标：
 - 读取已锁定 checkpoint
 - 让原始标签与置乱标签复用同一组预计算 5×5 RepeatedKFold splits
 - 输出修正后的有限置换 p 值 `(b + 1) / (m + 1)`
+- 将直方图写入根模型目录 `models/y_randomization_<ModelName>.png`
 
 ### 6. Checkpoint 加载
 

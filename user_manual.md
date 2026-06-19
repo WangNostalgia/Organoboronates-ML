@@ -233,6 +233,7 @@ The repository supports y-randomization as a standalone validation step, not as 
 - loads locked checkpoints
 - uses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
+- saves plots at `models/y_randomization_<ModelName>.png`
 
 ## 10. How to read metrics
 

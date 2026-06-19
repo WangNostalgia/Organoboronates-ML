@@ -71,6 +71,11 @@ DEFAULT_MODELS_DIR = 'models'
 DEFAULT_TARGET_COL = 'activation_energy'
 DEFAULT_OUTPUT_DIR = 'external_validation_results'
 
+
+class EnsembleValidationError(RuntimeError):
+    """Raised when ensemble members cannot produce a valid aggregate."""
+
+
 # Feature aliases — some external CSVs may use alternative column names for the
 # same physicochemical property.  This mapping normalises them to the canonical
 # names used during model training (derived from B_dataset.csv).
@@ -108,27 +113,23 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
         raise FileNotFoundError(f"Models directory not found: {models_dir}")
 
     records = []
-    pattern = os.path.join(models_dir, '*', '*_final_*.joblib')
-    for filepath in sorted(glob.glob(pattern)):
-        try:
-            info = joblib.load(filepath)
-        except Exception as exc:
-            logger.warning("Failed to load %s: %s", filepath, exc)
+    for model_dir in sorted(glob.glob(os.path.join(models_dir, '*'))):
+        if not os.path.isdir(model_dir):
             continue
-
-        model_name = os.path.basename(os.path.dirname(filepath))
-        n_features = info.get('optimal_n_features', len(info.get('features', [])))
-        features = info.get('features', [])
-        metrics = info.get('metrics', {})
-
-        records.append({
-            'model_name': model_name,
-            'n_features': n_features,
-            'features': ', '.join(features) if features else 'N/A',
-            'rkf_mae': metrics.get('rkf_mae_opt_mean'),
-            'rkf_r2': metrics.get('rkf_r2_opt_mean'),
-            'filepath': filepath,
-        })
+        for checkpoint in _discover_model_checkpoints(model_dir):
+            if checkpoint['checkpoint_type'] != 'final':
+                continue
+            info = checkpoint['model_info']
+            features = info.get('features', [])
+            metrics = info.get('metrics', {})
+            records.append({
+                'model_name': os.path.basename(model_dir),
+                'n_features': checkpoint['actual_n_features'],
+                'features': ', '.join(features) if features else 'N/A',
+                'rkf_mae': metrics.get('rkf_mae_opt_mean'),
+                'rkf_r2': metrics.get('rkf_r2_opt_mean'),
+                'filepath': checkpoint['path'],
+            })
 
     if not records:
         raise FileNotFoundError(
@@ -630,47 +631,115 @@ Examples:
     return results
 
 
-def _checkpoint_timestamp_from_path(filepath: str) -> str:
-    """Extract the trailing YYYYMMDD_HHMMSS timestamp from a checkpoint filename."""
-    match = re.search(r'(\d{8}_\d{6})\.joblib$', os.path.basename(filepath))
+def _checkpoint_filename_match(filepath: str, model_name: str = None):
+    """Match one canonical checkpoint filename using an anchored model prefix."""
+    canonical_name = model_name or os.path.basename(os.path.dirname(filepath))
+    pattern = re.compile(
+        rf"^{re.escape(canonical_name)}_"
+        r"(?:(?P<final>final)|iteration_(?P<iteration>\d+))_"
+        r"(?P<timestamp>\d{8}_\d{6})\.joblib$"
+    )
+    return pattern.fullmatch(os.path.basename(filepath))
+
+
+def _checkpoint_timestamp_from_path(filepath: str, model_name: str = None) -> str:
+    """Extract the canonical trailing timestamp from a checkpoint filename."""
+    match = _checkpoint_filename_match(filepath, model_name)
     if not match:
+        raise ValueError(f"Unrecognised checkpoint filename format: {filepath}")
+    return match.group('timestamp')
+
+
+def _checkpoint_type_from_path(filepath: str, model_name: str = None) -> str:
+    """Infer checkpoint category from a canonical anchored filename."""
+    match = _checkpoint_filename_match(filepath, model_name)
+    if not match:
+        raise ValueError(f"Unrecognised checkpoint filename format: {filepath}")
+    return 'final' if match.group('final') else 'iteration'
+
+
+def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
+    """Use len(features) as truth and reject contradictory saved metadata."""
+    actual_count = len(model_info.get('features', []))
+    metadata_count = model_info.get('optimal_n_features')
+    if metadata_count is not None and int(metadata_count) != actual_count:
+        source = f" in {filepath}" if filepath else ""
         raise ValueError(
-            f"Checkpoint filename does not end with a YYYYMMDD_HHMMSS timestamp: {filepath}"
+            f"Inconsistent checkpoint feature metadata{source}: "
+            f"optimal_n_features={metadata_count}, "
+            f"len(features)={actual_count}."
         )
-    return match.group(1)
+    return actual_count
 
 
-def _checkpoint_type_from_path(filepath: str) -> str:
-    """Infer checkpoint category from its filename."""
-    filename = os.path.basename(filepath)
-    if '_final_' in filename:
-        return 'final'
-    if '_iteration_' in filename:
-        return 'iteration'
-    raise ValueError(f"Unrecognised checkpoint filename format: {filepath}")
+def _nested_metric(metrics: dict, path):
+    value = metrics
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
 
 
-def _loaded_feature_count(model_info: dict) -> int:
-    """Return the saved feature count, falling back to the feature-list length."""
-    return int(model_info.get('optimal_n_features', len(model_info.get('features', []))))
+def _ensemble_weight_mae(model_info: dict) -> float:
+    """Read the member's internal-CV MAE without using stability metrics."""
+    metrics = model_info.get('metrics', {})
+    checkpoint_type = model_info.get('_checkpoint_type')
+    if checkpoint_type == 'iteration':
+        metric_paths = (
+            ('internal_cv', 'rkf_mae_mean'),
+            ('secondary', 'internal_cv', 'rkf_mae_mean'),
+            ('rkf_mae_mean',),
+            ('rkf_mae_opt_mean',),
+        )
+    else:
+        metric_paths = (
+            ('secondary', 'internal_cv', 'rkf_mae_mean'),
+            ('internal_cv', 'rkf_mae_mean'),
+            ('rkf_mae_mean',),
+            ('rkf_mae_opt_mean',),
+        )
+
+    for path in metric_paths:
+        value = _nested_metric(metrics, path)
+        if value is None:
+            continue
+        try:
+            mae = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Internal-CV MAE at metrics.{'.'.join(path)} must be numeric."
+            ) from exc
+        if not np.isfinite(mae) or mae <= 0:
+            raise ValueError(
+                f"Internal-CV MAE at metrics.{'.'.join(path)} must be "
+                f"finite and > 0; got {value!r}."
+            )
+        return mae
+
+    raise ValueError(
+        "No supported internal-CV MAE found. Expected "
+        "metrics.secondary.internal_cv.rkf_mae_mean for final checkpoints, "
+        "metrics.internal_cv.rkf_mae_mean for iteration checkpoints, or a "
+        "flat rkf_mae_mean/rkf_mae_opt_mean compatibility field."
+    )
 
 
 def _discover_model_checkpoints(model_dir: str):
     """Load checkpoint metadata for deterministic selection."""
     checkpoints = []
-    for pattern in (
-        os.path.join(model_dir, '*_final_*.joblib'),
-        os.path.join(model_dir, '*_iteration_*.joblib'),
-    ):
-        for path in sorted(glob.glob(pattern)):
-            info = joblib.load(path)
-            checkpoints.append({
-                'path': path,
-                'checkpoint_type': _checkpoint_type_from_path(path),
-                'timestamp': _checkpoint_timestamp_from_path(path),
-                'actual_n_features': _loaded_feature_count(info),
-                'model_info': info,
-            })
+    model_name = os.path.basename(os.path.normpath(model_dir))
+    for path in sorted(glob.glob(os.path.join(model_dir, '*.joblib'))):
+        if not _checkpoint_filename_match(path, model_name):
+            continue
+        info = joblib.load(path)
+        checkpoints.append({
+            'path': path,
+            'checkpoint_type': _checkpoint_type_from_path(path, model_name),
+            'timestamp': _checkpoint_timestamp_from_path(path, model_name),
+            'actual_n_features': _loaded_feature_count(info, filepath=path),
+            'model_info': info,
+        })
     return checkpoints
 
 
@@ -877,14 +946,23 @@ def ensemble_validation(ensemble_csv,
         logger.info("Dropped %d unnamed column(s)", len(unnamed_cols))
 
     df_external = df_external.rename(columns=_normalise_column_name)
+    original_index = df_external.index.copy()
+    original_index_name = original_index.name
+    original_index_col = 'original_index'
+    while original_index_col in df_external.columns:
+        original_index_col = f"_{original_index_col}"
+    df_external[original_index_col] = list(original_index)
+    df_external = df_external.reset_index(drop=True)
+    df_external.index.name = '_ensemble_row_id'
 
     all_predictions = {}
     model_weights = {}
     individual_results = []
     ensemble_members = []
     ensemble_errors = []
+    resolved_checkpoints = {}
 
-    for _, row in spec.iterrows():
+    for spec_position, (_, row) in enumerate(spec.iterrows(), start=1):
         model_name = row['model_name']
         requested_n_features = int(row['n_features'])
         requested_label = f"{model_name} ({requested_n_features} feat)"
@@ -901,12 +979,27 @@ def ensemble_validation(ensemble_csv,
             ensemble_errors.append((model_name, requested_n_features, str(exc)))
             continue
 
+        loaded_from = os.path.normcase(
+            os.path.realpath(os.path.abspath(model_info['_loaded_from']))
+        )
+        if loaded_from in resolved_checkpoints:
+            first_label = resolved_checkpoints[loaded_from]
+            error = (
+                f"Resolved to the same checkpoint as {first_label}: "
+                f"{os.path.basename(model_info['_loaded_from'])}"
+            )
+            logger.warning("Skipping %s: %s", requested_label, error)
+            ensemble_errors.append((model_name, requested_n_features, error))
+            continue
+        resolved_checkpoints[loaded_from] = requested_label
+
         model = model_info['model']
         scaler_X = model_info['scaler_X']
         scaler_y = model_info['scaler_y']
         expected_features = model_info['features']
         actual_n_features = model_info['_actual_n_features']
         label = f"{model_name} ({actual_n_features} feat)"
+        member_id = f"member_{spec_position}"
 
         missing = [f for f in expected_features if f not in df_external.columns]
         if missing:
@@ -916,11 +1009,30 @@ def ensemble_validation(ensemble_csv,
             )
             continue
 
+        try:
+            rkf_mae = _ensemble_weight_mae(model_info)
+            with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+                member_weight = float(1.0 / (rkf_mae ** 2))
+            if not np.isfinite(member_weight) or member_weight <= 0:
+                raise ValueError(
+                    f"Internal-CV MAE {rkf_mae!r} produces a non-finite "
+                    "or non-positive ensemble weight."
+                )
+        except ValueError as exc:
+            logger.warning("Skipping %s: %s", label, exc)
+            ensemble_errors.append((model_name, requested_n_features, str(exc)))
+            continue
+
         X_ext = df_external[expected_features].copy()
         nan_mask = X_ext.isna().any(axis=1)
         valid_index = X_ext.index[~nan_mask]
         if nan_mask.any():
             logger.warning("%s: dropping %d NaN row(s)", label, nan_mask.sum())
+        if len(valid_index) == 0:
+            error = f"{label} has no complete rows for its required features."
+            logger.warning("Skipping %s: %s", label, error)
+            ensemble_errors.append((model_name, requested_n_features, error))
+            continue
         X_valid = X_ext.loc[valid_index]
 
         X_scaled = scaler_X.transform(X_valid)
@@ -929,17 +1041,13 @@ def ensemble_validation(ensemble_csv,
             y_pred_scaled.reshape(-1, 1)
         ).ravel()
 
-        prediction_series = pd.Series(y_pred, index=valid_index, name=label)
-        all_predictions[label] = prediction_series
+        prediction_series = pd.Series(y_pred, index=valid_index, name=member_id)
+        all_predictions[member_id] = prediction_series
         ensemble_members.append((model_name, actual_n_features))
-
-        metrics = model_info.get('metrics', {})
-        rkf_mae = metrics.get('rkf_mae_opt_mean')
-        if rkf_mae is None or rkf_mae <= 0:
-            rkf_mae = metrics.get('mae_mean', 2.0)
-        model_weights[label] = 1.0 / (rkf_mae ** 2)
+        model_weights[member_id] = member_weight
 
         individual_results.append({
+            'member_id': member_id,
             'model_name': model_name,
             'n_features': actual_n_features,
             'label': label,
@@ -947,25 +1055,37 @@ def ensemble_validation(ensemble_csv,
             'mae': None,
             'r2': None,
             'rmse': None,
-            'weight': model_weights[label],
+            'weight': member_weight,
         })
         logger.info("%s: prediction complete", label)
 
     if not all_predictions:
-        raise RuntimeError(
-            f"No ensemble members loaded successfully. "
+        raise EnsembleValidationError(
+            f"No valid ensemble members produced predictions. "
             f"Errors: {ensemble_errors}"
         )
 
     prediction_frame = pd.concat(all_predictions.values(), axis=1, join='inner').dropna(how='any')
     if prediction_frame.empty:
-        raise RuntimeError(
-            "No common complete rows remain after aligning ensemble member predictions."
+        raise EnsembleValidationError(
+            "No common complete rows remain in the member prediction intersection."
         )
 
-    labels = list(prediction_frame.columns)
-    weight_array = np.array([model_weights[label] for label in labels], dtype=float)
-    weight_array = weight_array / weight_array.sum()
+    member_ids = list(prediction_frame.columns)
+    result_by_member_id = {
+        result['member_id']: result for result in individual_results
+    }
+    labels = [result_by_member_id[member_id]['label'] for member_id in member_ids]
+    weight_array = np.array(
+        [model_weights[member_id] for member_id in member_ids],
+        dtype=float,
+    )
+    weight_sum = float(weight_array.sum())
+    if not np.isfinite(weight_array).all() or not np.isfinite(weight_sum) or weight_sum <= 0:
+        raise EnsembleValidationError(
+            "Ensemble member weights must be finite and have a positive sum."
+        )
+    weight_array = weight_array / weight_sum
     y_pred_mean = prediction_frame.mean(axis=1)
     y_pred_weighted = prediction_frame.dot(weight_array)
     excluded_rows = len(df_external) - len(prediction_frame)
@@ -976,10 +1096,19 @@ def ensemble_validation(ensemble_csv,
                 {label: f"{weight:.3f}" for label, weight in zip(labels, weight_array)})
 
     id_cols = [c for c in ['sub_H', 'sub_B'] if c in df_external.columns]
-    results_df = df_external.loc[prediction_frame.index, id_cols].copy()
-    for label in labels:
+    results_df = df_external.loc[
+        prediction_frame.index,
+        [original_index_col] + id_cols,
+    ].copy()
+    used_prediction_columns = set()
+    for member_id, label in zip(member_ids, labels):
         safe_label = label.replace(' ', '_').replace('(', '').replace(')', '')
-        results_df[f'pred_{safe_label}'] = prediction_frame[label]
+        prediction_column = f'pred_{safe_label}'
+        if prediction_column in used_prediction_columns:
+            prediction_column = f'{prediction_column}_{member_id}'
+        used_prediction_columns.add(prediction_column)
+        results_df[prediction_column] = prediction_frame[member_id]
+        result_by_member_id[member_id]['prediction_column'] = prediction_column
 
     results_df['predicted_activation_energy'] = y_pred_weighted
     results_df['predicted_mean'] = y_pred_mean
@@ -1000,7 +1129,7 @@ def ensemble_validation(ensemble_csv,
             results_df['absolute_error_weighted'] = np.abs(y_pred_weighted - y_true)
 
             for result in individual_results:
-                preds = prediction_frame.loc[valid, result['label']]
+                preds = prediction_frame.loc[valid, result['member_id']]
                 result['mae'] = float(mean_absolute_error(y_true_valid, preds))
                 result['r2'] = float(r2_score(y_true_valid, preds))
                 result['rmse'] = float(np.sqrt(mean_squared_error(y_true_valid, preds)))
@@ -1012,6 +1141,13 @@ def ensemble_validation(ensemble_csv,
                 "  RMSE = %.4f kcal/mol",
                 mae, r2, rmse
             )
+
+    results_df.index = pd.Index(
+        results_df[original_index_col].tolist(),
+        name=original_index_name,
+    )
+    if original_index_col != 'original_index':
+        results_df = results_df.rename(columns={original_index_col: 'original_index'})
 
     os.makedirs(output_dir, exist_ok=True)
     output_files = []

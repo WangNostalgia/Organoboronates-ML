@@ -114,7 +114,7 @@ Legacy aliases may still exist for compatibility, but the current schema above i
 
 ### y-randomization
 
-The automatic full-pipeline y-randomization path remains disabled. The supported route is `example/standalone_y_randomization.py`, which reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets and reports the corrected finite-permutation p-value.
+The automatic full-pipeline y-randomization path remains disabled. The supported route is `example/standalone_y_randomization.py`, which reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets, reports the corrected finite-permutation p-value, and writes plots to `models/y_randomization_<ModelName>.png`.
 
 ### Checkpoint loading
 

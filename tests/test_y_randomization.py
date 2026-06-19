@@ -134,6 +134,15 @@ class YRandomizationTests(unittest.TestCase):
 
 
 class StandaloneYRandomizationTests(unittest.TestCase):
+    def test_standalone_documents_and_logs_root_level_plot_path(self):
+        source = Path("example/standalone_y_randomization.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("models/y_randomization_<ModelName>.png", source)
+        self.assertNotIn("models/<ModelName>/y_randomization_<ModelName>.png", source)
+        self.assertIn("Check models/ for y_randomization_*.png", source)
+
     def test_main_uses_exact_checkpoint_loading_and_stored_estimator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

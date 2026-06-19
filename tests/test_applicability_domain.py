@@ -13,6 +13,7 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import MinMaxScaler as SklearnMinMaxScaler
 
 from src.applicability_domain import (
+    _compute_knn_distance,
     _oof_residual_scale,
     _training_oof_predictions,
     applicability_domain_analysis,
@@ -71,7 +72,7 @@ def make_linear_model_info(X, y):
     scaler_y = SklearnMinMaxScaler(feature_range=(0, 100))
     X_scaled = scaler_X.fit_transform(X)
     y_scaled = scaler_y.fit_transform(np.asarray(y).reshape(-1, 1)).ravel()
-    model = LinearRegression()
+    model = LinearRegression(n_jobs=1)
     model.fit(X_scaled, y_scaled)
     return {
         "model": model,
@@ -83,11 +84,14 @@ def make_linear_model_info(X, y):
 
 class ApplicabilityDomainTests(unittest.TestCase):
     def setUp(self):
+        self.loky_env = patch.dict(os.environ, {"LOKY_MAX_CPU_COUNT": "1"})
+        self.loky_env.start()
         self.tmpdir = tempfile.TemporaryDirectory()
         self.output_dir = Path(self.tmpdir.name) / "outputs"
 
     def tearDown(self):
         self.tmpdir.cleanup()
+        self.loky_env.stop()
 
     def test_oof_residual_scale_uses_exact_mad_formula(self):
         residuals = np.array([1.0, 2.0, 100.0])
@@ -110,7 +114,13 @@ class ApplicabilityDomainTests(unittest.TestCase):
 
         RecordingMinMaxScaler.reset()
         with patch("src.applicability_domain.MinMaxScaler", RecordingMinMaxScaler):
-            preds = _training_oof_predictions(LinearRegression(), X, y, n_splits=3, random_state=42)
+            preds = _training_oof_predictions(
+                LinearRegression(n_jobs=1),
+                X,
+                y,
+                n_splits=3,
+                random_state=42,
+            )
 
         self.assertEqual(preds.shape, (len(X),))
         self.assertTrue(np.isfinite(preds).all())
@@ -211,6 +221,52 @@ class ApplicabilityDomainTests(unittest.TestCase):
         self.assertTrue(results["ad_results"]["std_residual"].isna().all())
         self.assertEqual(results["ad_summary"]["n_williams_high_residual"], 0)
         self.assertTrue(any(path.endswith(".png") and "williams_plot" in path for path in results["output_files"]))
+        summary_path = next(
+            path
+            for path in results["output_files"]
+            if "ad_summary" in Path(path).name and path.endswith(".txt")
+        )
+        summary_text = Path(summary_path).read_text(encoding="utf-8")
+        self.assertIn("Total external samples:          2", summary_text)
+        self.assertRegex(summary_text, r"Compounds flagged:\s+\d+")
+        self.assertRegex(summary_text, r"Percentage flagged:\s+\d+\.\d%")
+        interpretation = summary_text.split("--- Interpretation ---", 1)[1]
+        self.assertIn("leverage", interpretation.lower())
+        self.assertIn("k-NN", interpretation)
+        self.assertNotIn("residual", interpretation.lower())
+
+    def test_knn_distance_uses_single_job_estimator_to_avoid_loky_probe_warning(self):
+        X_train = np.array([[0.0], [0.5], [1.0], [1.5]])
+        X_external = np.array([[0.25], [1.25]])
+
+        with patch("src.applicability_domain.NearestNeighbors") as nn_class:
+            nn_class.return_value.fit.return_value = nn_class.return_value
+            nn_class.return_value.kneighbors.side_effect = [
+                (
+                    np.array(
+                        [
+                            [0.0, 0.5, 1.0],
+                            [0.0, 0.5, 0.5],
+                            [0.0, 0.5, 0.5],
+                            [0.0, 0.5, 1.0],
+                        ]
+                    ),
+                    np.zeros((4, 3), dtype=int),
+                ),
+                (
+                    np.array([[0.25, 0.25], [0.25, 0.25]]),
+                    np.zeros((2, 2), dtype=int),
+                ),
+            ]
+
+            _compute_knn_distance(
+                X_train_scaled=X_train,
+                X_ext_scaled=X_external,
+                k_neighbors=2,
+                z_threshold=3.0,
+            )
+
+        self.assertEqual(nn_class.call_args.kwargs["n_jobs"], 1)
 
     def test_cli_extracts_y_train_and_excludes_target_from_training_features(self):
         training_csv = Path(self.tmpdir.name) / "training.csv"

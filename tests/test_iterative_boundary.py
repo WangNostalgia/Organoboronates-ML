@@ -1,10 +1,12 @@
 import inspect
 import logging
 import os
+import re
 import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime as real_datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,7 +93,7 @@ install_optional_dependency_stubs()
 
 import main
 import src.iterative_optimization as iterative_module
-from src.iterative_optimization import iterative_optimization
+from src.iterative_optimization import clean_old_versions, iterative_optimization
 from src.visualization import (
     add_plot_labels,
     add_plot_labels_standard,
@@ -556,7 +558,14 @@ class IterativeBoundaryTests(unittest.TestCase):
         ), patch(
             "src.iterative_optimization.joblib.dump",
             side_effect=capture_dump,
-        ):
+        ), patch(
+            "src.iterative_optimization.datetime",
+        ) as datetime_mock:
+            datetime_mock.now.side_effect = [
+                real_datetime(2024, 1, 1, 12, 0, 1),
+                real_datetime(2024, 1, 1, 12, 0, 2),
+                real_datetime(2024, 1, 1, 12, 0, 3),
+            ]
             iterative_optimization(
                 {"SVR": SVR},
                 X,
@@ -582,6 +591,67 @@ class IterativeBoundaryTests(unittest.TestCase):
             self.assertEqual(
                 payload["metrics"]["internal_cv"]["rkf_mae_mean"],
                 float(feature_count),
+            )
+
+        checkpoint_filenames = [
+            filename
+            for filename in saved_payloads
+            if "_iteration_" in filename or "_final_" in filename
+        ]
+        timestamps = {
+            re.search(r"_(\d{8}_\d{6})\.joblib$", filename).group(1)
+            for filename in checkpoint_filenames
+        }
+        self.assertEqual(
+            len(timestamps),
+            1,
+            msg=f"one model run must use one timestamp family: {checkpoint_filenames}",
+        )
+
+    def test_clean_old_versions_keeps_two_complete_final_families(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            timestamps = [
+                "20240101_120000",
+                "20240102_120000",
+                "20240103_120000",
+            ]
+            for timestamp in timestamps:
+                for iteration in (1, 2):
+                    (model_dir / f"SVR_iteration_{iteration}_{timestamp}.joblib").touch()
+                    (model_dir / f"SVR_iteration_{iteration}_{timestamp}_metrics.txt").touch()
+                (model_dir / f"SVR_final_{timestamp}.joblib").touch()
+                (model_dir / f"SVR_final_{timestamp}_metrics.txt").touch()
+                (model_dir / f"performance_history_{timestamp}.csv").touch()
+                (model_dir / f"final_scatter_{timestamp}.png").touch()
+
+            orphan_timestamp = "20240104_120000"
+            (model_dir / f"SVR_iteration_99_{orphan_timestamp}.joblib").touch()
+
+            clean_old_versions(str(model_dir), keep_versions=2)
+
+            remaining_names = {path.name for path in model_dir.iterdir()}
+            for timestamp in timestamps[-2:]:
+                self.assertTrue(
+                    any(timestamp in name for name in remaining_names),
+                    msg=f"missing retained family {timestamp}: {remaining_names}",
+                )
+                self.assertEqual(
+                    sum(
+                        name.startswith("SVR_iteration_")
+                        and name.endswith(f"{timestamp}.joblib")
+                        for name in remaining_names
+                    ),
+                    2,
+                )
+
+            self.assertFalse(
+                any(timestamps[0] in name for name in remaining_names),
+                msg=f"old family was not removed: {remaining_names}",
+            )
+            self.assertFalse(
+                any(orphan_timestamp in name for name in remaining_names),
+                msg=f"orphan iteration was retained: {remaining_names}",
             )
 
     def test_iterative_signature_and_main_parser_expose_only_current_selection_controls(self):

@@ -200,7 +200,7 @@ class MainCliDefinitionTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(completed.returncode, 2)
             self.assertIn("GPlearn", completed.stderr)
             self.assertFalse((Path(tmpdir) / "models").exists())
             self.assertEqual(list(Path(tmpdir).glob("optimization_*.log")), [])

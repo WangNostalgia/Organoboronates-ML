@@ -109,6 +109,7 @@ Automatic full-pipeline y-randomization remains disabled in the main workflow. T
 - loads selected checkpoints
 - reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
+- writes each histogram to `models/y_randomization_<ModelName>.png`
 
 ### 6. Checkpoint loading
 

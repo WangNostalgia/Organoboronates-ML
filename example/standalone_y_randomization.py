@@ -20,7 +20,7 @@ The CSV format (same file used by manual_selection_and_plot.py):
 Usage:
     1. Ensure the CSV exists (default: 'example/manual_feature_selection.csv')
     2. Run: python example/standalone_y_randomization.py
-    3. Check models/<ModelName>/y_randomization_<ModelName>.png for histograms
+    3. Check models/y_randomization_<ModelName>.png for histograms
 ===============================================================================
 """
 
@@ -120,7 +120,7 @@ def main():
             logger.error("%s: y-randomization failed — %s", model_name, exc, exc_info=True)
             continue
 
-    logger.info("All models processed. Check models/<ModelName>/ for y_randomization_*.png")
+    logger.info("All models processed. Check models/ for y_randomization_*.png")
 
 
 if __name__ == '__main__':

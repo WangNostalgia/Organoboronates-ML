@@ -31,43 +31,40 @@ def clean_old_versions(model_dir, keep_versions=2):
     """Keep only the newest final-model runs and matching iteration checkpoints."""
     logger = logging.getLogger(__name__)
     final_pattern = re.compile(r"_final_(\d{8}_\d{6})\.joblib$")
-    final_files = {}
+    iteration_pattern = re.compile(r"_iteration_\d+_(\d{8}_\d{6})\.joblib$")
+    artifact_pattern = re.compile(
+        r"(\d{8}_\d{6})(?:_(?:metrics|outliers))?\.[^.]+$"
+    )
+    final_timestamps = set()
 
     for filepath in glob.glob(os.path.join(model_dir, "*_final_*.joblib")):
-        match = final_pattern.search(filepath)
-        if not match:
-            continue
-        timestamp = match.group(1)
-        final_files.setdefault(timestamp, []).append(filepath)
-        metrics_path = filepath.replace(".joblib", "_metrics.txt")
-        if os.path.exists(metrics_path):
-            final_files[timestamp].append(metrics_path)
-
-    for timestamp in sorted(final_files, reverse=True)[keep_versions:]:
-        for filepath in final_files[timestamp]:
-            try:
-                os.remove(filepath)
-                logger.info("Deleted old version file: %s", os.path.basename(filepath))
-            except OSError as exc:
-                logger.info("Failed to delete file %s: %s", filepath, exc)
-
-    iteration_pattern = re.compile(r"_iteration_\d+_(\d{8}_\d{6})\.joblib$")
-    iteration_files = {}
-    for filepath in glob.glob(os.path.join(model_dir, "*_iteration_*.joblib")):
-        match = iteration_pattern.search(filepath)
+        match = final_pattern.search(os.path.basename(filepath))
         if match:
-            iteration_files.setdefault(match.group(1), []).append(filepath)
+            final_timestamps.add(match.group(1))
 
-    for timestamp in sorted(iteration_files, reverse=True)[keep_versions:]:
-        for filepath in iteration_files[timestamp]:
-            try:
-                os.remove(filepath)
-                metrics_path = filepath.replace(".joblib", "_metrics.txt")
-                if os.path.exists(metrics_path):
-                    os.remove(metrics_path)
-                logger.info("Deleted old iteration file: %s", os.path.basename(filepath))
-            except OSError as exc:
-                logger.info("Failed to delete file %s: %s", filepath, exc)
+    if final_timestamps:
+        retained_timestamps = set(
+            sorted(final_timestamps, reverse=True)[:keep_versions]
+        )
+    else:
+        iteration_timestamps = set()
+        for filepath in glob.glob(os.path.join(model_dir, "*_iteration_*.joblib")):
+            match = iteration_pattern.search(os.path.basename(filepath))
+            if match:
+                iteration_timestamps.add(match.group(1))
+        retained_timestamps = set(
+            sorted(iteration_timestamps, reverse=True)[:keep_versions]
+        )
+
+    for filepath in glob.glob(os.path.join(model_dir, "*")):
+        match = artifact_pattern.search(os.path.basename(filepath))
+        if not match or match.group(1) in retained_timestamps:
+            continue
+        try:
+            os.remove(filepath)
+            logger.info("Deleted old run artifact: %s", os.path.basename(filepath))
+        except OSError as exc:
+            logger.info("Failed to delete file %s: %s", filepath, exc)
 
 
 def _fit_on_development(estimator, X_development, y_development):
@@ -412,6 +409,7 @@ def iterative_optimization(
         model_dir = os.path.join(models_dir, model_name)
         os.makedirs(model_dir, exist_ok=True)
         clean_old_versions(model_dir, keep_versions)
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         effective_min_features = min_features
         if custom_min_features and model_name in custom_min_features:
@@ -531,10 +529,9 @@ def iterative_optimization(
                         artifacts["estimator"], X_model, y_development
                     )
                 )
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 checkpoint_path = os.path.join(
                     model_dir,
-                    f"{model_name}_iteration_{iteration}_{timestamp}",
+                    f"{model_name}_iteration_{iteration}_{run_timestamp}",
                 )
                 checkpoint_info = {
                     "model": checkpoint_model,
@@ -645,18 +642,17 @@ def iterative_optimization(
             selected_history_index
         ] = test_r2
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plot_performance_history(
             performance_history,
             model_name,
             os.path.join(
-                model_dir, f"performance_history_{timestamp}.png"
+                model_dir, f"performance_history_{run_timestamp}.png"
             ),
         )
         save_performance_history(
             performance_history,
             os.path.join(
-                model_dir, f"performance_history_{timestamp}.csv"
+                model_dir, f"performance_history_{run_timestamp}.csv"
             ),
         )
 
@@ -682,7 +678,7 @@ def iterative_optimization(
             "evaluation_protocol": dict(evaluation_protocol),
         }
         final_model_path = os.path.join(
-            model_dir, f"{model_name}_final_{timestamp}"
+            model_dir, f"{model_name}_final_{run_timestamp}"
         )
         joblib.dump(final_model_info, f"{final_model_path}.joblib")
         _write_final_metrics(
@@ -703,7 +699,7 @@ def iterative_optimization(
             model_name=f"{model_name} ({len(final_features)} features)",
             mae_mean=result["stability"]["mae_mean"],
             output_dir=model_dir + os.sep,
-            output_name=f"final_scatter_{timestamp}.png",
+            output_name=f"final_scatter_{run_timestamp}.png",
             X_train=X_development[final_features],
             X_test=X_final_test[final_features],
             r2_loo=result["loo"]["r2"],

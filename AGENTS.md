@@ -118,7 +118,7 @@ Legacy aliases may still be stored for compatibility, but agent-facing docs and 
 
 ### y-randomization
 
-The automatic full-pipeline y-randomization block remains disabled because of runtime cost. Supported validation is the standalone script `example/standalone_y_randomization.py`, which reuses the same precomputed 5×5 RepeatedKFold splits for original and permuted targets and reports the corrected finite-permutation p-value.
+The automatic full-pipeline y-randomization block remains disabled because of runtime cost. Supported validation is the standalone script `example/standalone_y_randomization.py`, which reuses the same precomputed 5×5 RepeatedKFold splits for original and permuted targets, reports the corrected finite-permutation p-value, and writes plots to `models/y_randomization_<ModelName>.png`.
 
 ### Checkpoint loading
 

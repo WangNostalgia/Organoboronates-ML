@@ -152,6 +152,7 @@ def applicability_domain_analysis(model_info, X_train, X_external,
         'knn_training_mean': float(knn_data['training_mean']),
         'knn_training_std': float(knn_data['training_std']),
         'leverage_note': williams_data['leverage_note'],
+        'prediction_only': y_external_arr is None,
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -341,7 +342,11 @@ def _compute_knn_distance(X_train_scaled, X_ext_scaled, k_neighbors, z_threshold
     if k_neighbors < 1 or k_neighbors > (n_train - 1):
         raise ValueError(f"k_neighbors must be between 1 and {n_train - 1} for {n_train} training samples.")
 
-    nn = NearestNeighbors(n_neighbors=k_neighbors + 1, metric='euclidean')
+    nn = NearestNeighbors(
+        n_neighbors=k_neighbors + 1,
+        metric='euclidean',
+        n_jobs=1,
+    )
     nn.fit(X_train_scaled)
 
     train_distances, _ = nn.kneighbors(X_train_scaled)
@@ -483,6 +488,7 @@ def _write_ad_summary(summary_path, model_name, ad_summary, features):
         f.write(f"Model:        {model_name}\n")
         f.write(f"Features:     {', '.join(features)}\n")
         f.write(f"Timestamp:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total external samples:          {ad_summary['n_total']}\n")
         f.write("\n--- Williams Plot ---\n")
         f.write(f"Leverage threshold (h*):        {ad_summary['h_star']:.6f}\n")
         f.write(f"Residual threshold:             ±{ad_summary['residual_critical']:.0f}σ\n")
@@ -497,6 +503,26 @@ def _write_ad_summary(summary_path, model_name, ad_summary, features):
         f.write(f"k-NN warnings:                  {ad_summary['n_knn_warning']}\n")
         f.write("\n--- Combined ---\n")
         f.write(f"Compounds flagged:              {ad_summary['n_combined_warning']}\n")
+        flagged_percentage = (
+            100.0 * ad_summary['n_combined_warning'] / max(ad_summary['n_total'], 1)
+        )
+        f.write(f"Percentage flagged:             {flagged_percentage:.1f}%\n")
+        f.write("\n--- Interpretation ---\n")
+        if ad_summary.get('prediction_only', False):
+            f.write(
+                "Prediction-only mode: flagged samples fall outside the "
+                "leverage and/or k-NN distance criteria.\n"
+            )
+        elif ad_summary['n_combined_warning']:
+            f.write(
+                "Flagged samples exceed at least one Williams-plot or k-NN "
+                "applicability-domain criterion.\n"
+            )
+        else:
+            f.write(
+                "All external samples satisfy the configured Williams-plot "
+                "and k-NN applicability-domain criteria.\n"
+            )
 
 
 def _to_dataframe(data, label='data'):

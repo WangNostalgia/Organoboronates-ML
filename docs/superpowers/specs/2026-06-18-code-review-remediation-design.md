@@ -220,7 +220,7 @@ The implementation becomes authoritative. Update:
 - `README.md`
 - `README_CN.md`
 - `user_manual.md`
-- `Pipeline.md` and the duplicate `pipeline.md`
+- the canonical `pipeline.md` workflow document
 - Relevant examples and `AGENTS.md` only where their operational descriptions
   contradict the repaired workflow
 
