@@ -40,10 +40,7 @@ import glob
 import re
 import argparse
 import logging
-import pickle
-import struct
 import warnings
-import zlib
 from collections.abc import Sequence
 from datetime import datetime
 from numbers import Integral
@@ -786,12 +783,7 @@ def _discover_model_checkpoints(model_dir: str):
             continue
         try:
             info = joblib.load(path)
-        except (
-            EOFError,
-            pickle.UnpicklingError,
-            struct.error,
-            zlib.error,
-        ) as exc:
+        except Exception as exc:
             logger.warning(
                 "Skipping corrupt checkpoint %s: %s: %s",
                 path,

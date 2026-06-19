@@ -35,6 +35,15 @@ class ConstantPredictionModel:
         return np.full(len(X), self.prediction, dtype=float)
 
 
+def _raise_key_error_during_load():
+    raise KeyError("simulated corrupt checkpoint")
+
+
+class KeyErrorDuringLoad:
+    def __reduce__(self):
+        return (_raise_key_error_during_load, ())
+
+
 def write_checkpoint(
     root,
     model_name,
@@ -325,6 +334,34 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual([Path(item["path"]) for item in checkpoints], [final_path])
         warning_mock.assert_called_once()
         self.assertEqual(warning_mock.call_args.args[1], str(corrupt_path))
+
+        available = list_available_models(models_dir=str(self.models_dir))
+        self.assertEqual(available["model_name"].tolist(), ["SVR"])
+        model_info = load_model("SVR", models_dir=str(self.models_dir))
+        self.assertEqual(Path(model_info["_loaded_from"]), final_path)
+        self.assertEqual(model_info["model"].prediction, 5.0)
+
+    def test_keyerror_during_deserialization_is_skipped_without_blocking_healthy_final(self):
+        final_path = write_checkpoint(
+            self.models_dir,
+            "SVR",
+            "final",
+            "20240101_120000",
+            ["f1", "f2"],
+            prediction=5.0,
+        )
+        corrupt_path = self.models_dir / "SVR" / "SVR_iteration_1_20240102_120000.joblib"
+        joblib.dump(KeyErrorDuringLoad(), corrupt_path)
+
+        with patch("src.external_validation.logger.warning") as warning_mock:
+            checkpoints = _discover_model_checkpoints(
+                str(self.models_dir / "SVR")
+            )
+
+        self.assertEqual([Path(item["path"]) for item in checkpoints], [final_path])
+        warning_mock.assert_called_once()
+        self.assertEqual(warning_mock.call_args.args[1], str(corrupt_path))
+        self.assertEqual(warning_mock.call_args.args[2], "KeyError")
 
         available = list_available_models(models_dir=str(self.models_dir))
         self.assertEqual(available["model_name"].tolist(), ["SVR"])

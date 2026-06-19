@@ -1,4 +1,5 @@
 import inspect
+import joblib
 import logging
 import os
 import re
@@ -638,7 +639,7 @@ class IterativeBoundaryTests(unittest.TestCase):
         checkpoint_filenames = [
             filename
             for filename in saved_payloads
-            if "_iteration_" in filename or "_final_" in filename
+            if re.search(r"_(\d{8}_\d{6})\.joblib$", filename)
         ]
         timestamps = {
             re.search(r"_(\d{8}_\d{6})\.joblib$", filename).group(1)
@@ -935,6 +936,116 @@ class IterativeBoundaryTests(unittest.TestCase):
                 names_after_cleanup,
                 family_names(old_timestamp) | family_names(retained_timestamp),
             )
+
+    def test_failed_final_checkpoint_dump_leaves_no_new_canonical_or_temp_files(self):
+        X, y = make_sentinel_dataset()
+        retained_timestamp = "20240102_120000"
+        new_timestamp = "20240103_120000"
+
+        def family_names(timestamp):
+            return {
+                f"SVR_iteration_1_{timestamp}.joblib",
+                f"SVR_iteration_1_{timestamp}_metrics.txt",
+                f"SVR_final_{timestamp}.joblib",
+                f"SVR_final_{timestamp}_metrics.txt",
+                f"performance_history_{timestamp}.csv",
+                f"performance_history_{timestamp}.png",
+                f"final_scatter_{timestamp}.png",
+                f"final_scatter_{timestamp}_outliers.csv",
+            }
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(
+                model_class,
+                X_arg.shape[1],
+                n_jobs=kwargs["n_jobs"],
+            )
+
+        def touch_performance_plot(history, model_name, output_path):
+            Path(output_path).touch()
+
+        def touch_performance_csv(history, output_path):
+            Path(output_path).touch()
+
+        def touch_scatter(**kwargs):
+            scatter_path = Path(kwargs["output_dir"]) / kwargs["output_name"]
+            scatter_path.touch()
+            scatter_path.with_name(
+                scatter_path.name.replace(".png", "_outliers.csv")
+            ).touch()
+
+        real_joblib_dump = joblib.dump
+
+        def partially_written_final_dump(payload, path):
+            path_obj = Path(path)
+            if f"SVR_final_{new_timestamp}" in path_obj.name:
+                path_obj.write_bytes(b"partial-final-checkpoint")
+                raise RuntimeError("simulated final dump failure")
+            return real_joblib_dump(payload, path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "models" / "SVR"
+            model_dir.mkdir(parents=True)
+            for name in family_names(retained_timestamp):
+                (model_dir / name).touch()
+
+            with patch(
+                "src.iterative_optimization.os.getcwd",
+                return_value=tmpdir,
+            ), patch(
+                "src.iterative_optimization.setup_logger",
+                return_value=logging.getLogger("failed-final-dump-test"),
+            ), patch(
+                "src.iterative_optimization.hyperparameter_optimization_and_training",
+                side_effect=fake_tuning,
+            ), patch(
+                "src.iterative_optimization.leave_one_out_validation",
+                return_value=(0.55, 1.25),
+            ), patch(
+                "src.iterative_optimization.plot_performance_history",
+                side_effect=touch_performance_plot,
+            ), patch(
+                "src.iterative_optimization.save_performance_history",
+                side_effect=touch_performance_csv,
+            ), patch(
+                "src.iterative_optimization.plot_scatter",
+                side_effect=touch_scatter,
+            ), patch(
+                "src.iterative_optimization.clean_old_versions",
+            ) as cleanup_mock, patch(
+                "src.iterative_optimization.joblib.dump",
+                side_effect=partially_written_final_dump,
+            ), patch(
+                "src.iterative_optimization.datetime",
+            ) as datetime_mock:
+                datetime_mock.now.return_value = real_datetime(
+                    2024, 1, 3, 12, 0, 0
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "simulated final dump failure",
+                ):
+                    iterative_optimization(
+                        {"SVR": SVR},
+                        X,
+                        y,
+                        n_trials=1,
+                        n_jobs=1,
+                        keep_versions=1,
+                        min_features=3,
+                    )
+
+            names_after_failure = {path.name for path in model_dir.iterdir()}
+            self.assertTrue(
+                family_names(retained_timestamp).issubset(names_after_failure)
+            )
+            self.assertFalse(
+                any(
+                    f"SVR_final_{new_timestamp}" in name
+                    for name in names_after_failure
+                )
+            )
+            cleanup_mock.assert_called_once_with(str(model_dir), 1)
 
     def test_iterative_signature_and_main_parser_expose_only_current_selection_controls(self):
         signature = inspect.signature(iterative_optimization)

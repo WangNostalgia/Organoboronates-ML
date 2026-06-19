@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime
 from numbers import Integral
 
@@ -377,6 +378,64 @@ def _write_final_metrics(
             handle.write(f"\nGPlearn Formula:\n  {estimator.formula_}\n")
 
 
+def _temporary_sibling_path(final_path):
+    directory = os.path.dirname(final_path) or "."
+    basename = os.path.basename(final_path)
+    handle, temp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{basename}.tmp-",
+        suffix=".tmp",
+    )
+    os.close(handle)
+    return temp_path
+
+
+def _remove_if_exists(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _write_final_artifacts_atomically(
+    final_model_path,
+    final_model_info,
+    model_name,
+    result,
+    evaluation_protocol,
+    force_n_features,
+    estimator,
+):
+    final_metrics_path = f"{final_model_path}_metrics.txt"
+    final_joblib_path = f"{final_model_path}.joblib"
+    temp_metrics_path = _temporary_sibling_path(final_metrics_path)
+    temp_joblib_path = _temporary_sibling_path(final_joblib_path)
+    created_canonical_paths = []
+
+    try:
+        _write_final_metrics(
+            temp_metrics_path,
+            model_name,
+            result,
+            evaluation_protocol,
+            force_n_features,
+            estimator,
+        )
+        joblib.dump(final_model_info, temp_joblib_path)
+
+        os.replace(temp_metrics_path, final_metrics_path)
+        created_canonical_paths.append(final_metrics_path)
+
+        os.replace(temp_joblib_path, final_joblib_path)
+        created_canonical_paths.append(final_joblib_path)
+    except Exception:
+        _remove_if_exists(temp_metrics_path)
+        _remove_if_exists(temp_joblib_path)
+        for path in created_canonical_paths:
+            _remove_if_exists(path)
+        raise
+
+
 def iterative_optimization(
     models,
     X,
@@ -729,15 +788,15 @@ def iterative_optimization(
             precomputed_metrics=scatter_metrics,
         )
 
-        _write_final_metrics(
-            f"{final_model_path}_metrics.txt",
+        _write_final_artifacts_atomically(
+            final_model_path,
+            final_model_info,
             model_name,
             result,
             evaluation_protocol,
             force_n_features,
             final_estimator,
         )
-        joblib.dump(final_model_info, f"{final_model_path}.joblib")
 
         clean_old_versions(model_dir, keep_versions)
 

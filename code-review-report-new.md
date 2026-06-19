@@ -1,11 +1,11 @@
 # 代码审查修复报告（最终复审）
 
-日期：2026-06-19
+日期：2026-06-20
 分支：`codex/code-review-remediation`
 对比基线：`master`（merge-base `30f919b`）
 前序 final-wave 提交：`a5ca47d fix: close final review edge cases`
 前序 family-retention 提交：`c069d43 fix: enforce exact run family retention`
-本轮最终门禁代码提交：`b860c6f fix: close final persistence and checkpoint gates`
+本轮最终门禁代码提交：见本次提交（final 原子写与 checkpoint 反序列化隔离收口）
 
 ## 1. 最终结论
 
@@ -13,7 +13,7 @@
 
 - `clean_old_versions()` 现在只识别当前模型目录 basename 对应的 canonical 产物。
 - `keep_versions` 在 API/helper/CLI 三层均严格要求正整数，bool 无效，非法 API 调用在 split/getcwd/logger/write 前原子失败，CLI 返回 exit code 2 且无运行时副作用。
-- history、scatter 和 outlier 成功后才写 final metrics/checkpoint；final joblib 是完整 family 的最后完成标记。
+- history、scatter 和 outlier 成功后，final metrics/joblib 会先写同目录临时文件，再用 `os.replace()` 原子落位；任一步失败都会清理临时/新 canonical final 文件，final joblib 仍是完整 family 的最后完成标记。
 - 无 final joblib 的 iteration/history/scatter 都按 orphan 处理；下次开头 cleanup 会删除 orphan，同时保留旧完整 families。
 - 损坏 checkpoint 的反序列化异常会记录 warning 并跳过单个文件；可读但 metadata/schema 非法的 checkpoint 仍明确抛出 `ValueError`。
 - checkpoint `features` 必须是非字符串 sequence，元素为非空字符串且唯一；`optimal_n_features` 只接受非 bool 的 Python/NumPy integral。
@@ -72,14 +72,17 @@ escaped_model_name = re.escape(model_name)
 1. performance history PNG；
 2. performance history CSV；
 3. final scatter，以及存在 outlier 时对应的 outlier CSV；
-4. final metrics；
-5. final joblib（最后的完整 family 标记）；
-6. `clean_old_versions(model_dir, keep_versions)`。
+4. final metrics 临时文件；
+5. final joblib 临时文件；
+6. `os.replace()` final metrics；
+7. `os.replace()` final joblib（最后的完整 family 标记）；
+8. `clean_old_versions(model_dir, keep_versions)`。
 
 结果是：
 
 - 预置两个 family、完成一个新 run 且 `keep_versions=2` 时，只剩最新两个完整 family。
 - 如果 scatter 失败，本次 timestamp 不会留下 final joblib/final metrics，且末尾 cleanup 不执行。
+- 如果 final metrics/joblib 任一步失败，本次 timestamp 不会留下 canonical final 或临时文件，且末尾 cleanup 不执行。
 - 失败 run 可能暂留 iteration/history orphan；下一次开头 cleanup 会删除这些 orphan，同时旧两个完整 family 保持不变。
 
 ### 2.4 严格的 checkpoint features schema 与特征数 metadata
@@ -109,9 +112,9 @@ escaped_model_name = re.escape(model_name)
 
 ### 2.5 损坏 checkpoint 的隔离
 
-`_discover_model_checkpoints()` 只在 `joblib.load()` 周围捕获明确的
-反序列化损坏异常（EOF、pickle、struct、zlib），记录包含路径和异常类型的
-warning 后跳过该文件。
+`_discover_model_checkpoints()` 只在 `joblib.load()` 周围捕获
+`Exception`（因此覆盖 EOF、pickle、KeyError、IndexError、ValueError 等单文件反序列化失败），
+记录包含路径和异常类型的 warning 后跳过该文件。
 
 - 健康 final 与截断 iteration 并存时，discovery/list/load 继续使用健康 final。
 - 如果 canonical checkpoints 全部损坏，选择层按正常的 “No final or iteration checkpoints found” 路径失败。
@@ -149,7 +152,8 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 | 模型列表 schema | 2 failed；nested current 被 legacy 覆盖，direct/flat current 得到 NaN | 2 passed |
 | `keep_versions` 正整数 | API/helper/CLI 新测试失败；非法值进入 split/runtime | API/helper/CLI 原子性测试通过 |
 | scatter 后完成标记 | 失败 run 仍留下 final joblib/metrics | 失败 run 无 final，后续 cleanup 只删 orphan |
-| 损坏 checkpoint | 截断 iteration 阻断健康 final discovery/list/load | 损坏文件 warning+skip；全损坏走 No checkpoints |
+| final 原子写 | partial final dump 后残留 canonical final/临时文件 | partial final dump 后旧健康 family 保留、无 canonical final/临时文件 |
+| 损坏 checkpoint | 截断 iteration 或 `KeyError` 损坏 iteration 阻断健康 final discovery/list/load | 损坏文件 warning+skip；全损坏走 No checkpoints |
 | features schema | string、非 str 项、空项、重复项可通过 `len()` | 统一 `ValueError` 且包含 checkpoint path |
 
 新增/强化测试覆盖：
@@ -159,10 +163,11 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 - canonical final/iteration joblib、metrics、history、scatter、outlier CSV。
 - lightweight 新 run 的两个完整 family retention。
 - scatter 异常时无 final joblib/metrics、不做完成后清理；显式后续 cleanup 保留旧两个完整 family 并删除失败 run orphan。
+- partial final dump 时旧健康 family 保留、无 canonical final/临时文件。
 - `2.9`、`'2'`、bool、Python int、NumPy integer。
 - nested current、direct current、flat current、legacy flat metrics。
 - API/helper 的 `keep_versions` 非法值与 CLI `0`/`-1`。
-- 有效 final + 截断 iteration、全部 checkpoint 损坏。
+- 有效 final + 截断 iteration、有效 final + `KeyError` 损坏 iteration、全部 checkpoint 损坏。
 - features 为字符串、包含非字符串、空/空白名称、重复名称。
 
 ## 4. 最终验证
@@ -173,7 +178,7 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 python -m pytest tests/test_iterative_boundary.py tests/test_external_validation.py tests/test_applicability_domain.py tests/test_examples_and_cli.py tests/test_y_randomization.py -q
 ```
 
-结果：`74 passed in 6.05s`
+结果：`76 passed in 6.83s`
 
 ### 4.2 全套 pytest
 
@@ -181,7 +186,7 @@ python -m pytest tests/test_iterative_boundary.py tests/test_external_validation
 python -m pytest -q
 ```
 
-结果：`89 passed in 8.90s`
+结果：`91 passed in 10.66s`
 
 ### 4.3 unittest
 
@@ -189,7 +194,7 @@ python -m pytest -q
 python -m unittest discover -s tests -q
 ```
 
-结果：`Ran 89 tests in 6.646s`，`OK`。
+结果：`Ran 91 tests in 8.080s`，`OK`。
 
 输出中的奇异矩阵 pseudo-inverse fallback、损坏 checkpoint skip warning
 均为测试覆盖的预期应用日志，不是测试失败。
@@ -209,7 +214,7 @@ python src/external_validation.py --help
 ### 4.5 diff 与静态检查
 
 - `git diff --check`：exit code 0，无 whitespace error。
-- AST/源码顺序断言确认 `keep_versions` 是 `iterative_optimization()` 的首个可执行校验，且写入顺序为 scatter → final metrics → final joblib → cleanup。
+- AST/源码顺序断言确认 `keep_versions` 是 `iterative_optimization()` 的首个可执行校验，且写入顺序为 scatter → final metrics temp → final joblib temp → replace metrics → replace joblib → cleanup。
 - Windows Git 仅提示工作区文件未来可能进行 LF→CRLF 转换。
 - ensemble 实现不再命中：
   - `all_predictions[label]`
@@ -274,17 +279,12 @@ Resolved 77 packages
 34. `user_manual.md`
 35. `uv.lock`
 
-本轮最终门禁代码提交 `b860c6f` 修改 6 个文件：
+本轮当前提交将更新 5 个文件：
 
-- `main.py`
 - `src/iterative_optimization.py`
 - `src/external_validation.py`
-- `tests/test_examples_and_cli.py`
 - `tests/test_iterative_boundary.py`
 - `tests/test_external_validation.py`
-
-本轮报告提交只更新：
-
 - `code-review-report-new.md`
 
 ## 6. 遗留关注项
