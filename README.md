@@ -4,13 +4,13 @@
 
 [English](README.md) | [中文](README_CN.md)
 
-This repository contains the supplementary machine-learning workflow for the Nature Communications paper ["Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond"](https://doi.org/10.1038/s41467-025-60674-9). The code predicts reaction activation energies in kcal/mol and ships with training, checkpointing, external validation, applicability-domain analysis, and standalone y-randomization utilities.
+This repository contains the supplementary machine-learning workflow for the Nature Communications paper ["Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond"](https://doi.org/10.1038/s41467-025-60674-9).
 
-More detailed references:
+Active references:
 
-- Conceptual workflow: [Pipeline.md](Pipeline.md)
+- Conceptual workflow: [pipeline.md](pipeline.md)
 - Step-by-step execution guide: [user_manual.md](user_manual.md)
-- Repository-specific agent guidance: [AGENTS.md](AGENTS.md)
+- Agent guidance: [AGENTS.md](AGENTS.md)
 
 ## Requirements
 
@@ -18,35 +18,21 @@ More detailed references:
 - Recommended installer: `uv sync`
 - Alternative installer: `pip install -r requirements.txt`
 
-The supported full installation includes:
-
-- scikit-learn
-- optuna
-- shap
-- xgboost
-- lightgbm
-- catboost
-- gplearn
-- matplotlib / seaborn / pandas / numpy / joblib
+The default runtime includes the scikit-learn stack plus XGBoost, LightGBM, CatBoost, and `gplearn==0.4.2`.
 
 ## Quick start
 
 ```bash
 uv sync
 python main.py --n_trials 100 --min_features 5
+python main.py --n_trials 20 --min_features 5
+python main.py --help
+python example/standalone_y_randomization.py
 ```
-
-Useful variants:
-
-- Quick smoke run: `python main.py --n_trials 20 --min_features 5`
-- Show CLI help: `python main.py --help`
-- Evaluation notebook: `jupyter notebook example/example_pic.ipynb`
-- Prediction notebook: `jupyter notebook example/prediction_round2.ipynb`
-- Standalone y-randomization: `python example/standalone_y_randomization.py`
 
 ## Active default model registry
 
-`main.py` currently enables these models by default:
+`main.py` currently enables these model families by default:
 
 - LinearRegression
 - Ridge
@@ -65,80 +51,76 @@ Useful variants:
 - CatBoost
 - GPlearn
 
-`GaussianProcessRegressor` is still present in the file but commented out, so it is not part of the default run.
+`GaussianProcessRegressor` remains commented out and is not part of the default run.
 
 ## Current training and evaluation protocol
 
-### 1. Fixed boundary between development and final test
+### 1. One shared development/final-test split
 
-`iterative_optimization()` creates one 80/20 split at the entry point with `random_state=40`, and every active model family shares that exact split.
+`iterative_optimization()` creates one 80/20 split at the entry point with `random_state=40`, and all default models share that same split.
 
-- Development set (80%): hyperparameter tuning, SHAP-driven feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability analysis
-- Final test set (20%): scored exactly once after feature count and hyperparameters are locked
+- Development set: tuning, SHAP feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability
+- Final test set: scored exactly once after the feature count and hyperparameters are locked
 
-The test set is not used for model selection.
+The final test split is never used for model selection.
 
-### 2. Hyperparameter tuning
+### 2. Development-only tuning
 
 `src/train_and_evaluate.py` tunes on development data only.
 
 - Optuna uses an internal 5-fold MAE objective
-- Studies are in-memory for each run
-- Ridge and Lasso use explicit fold-local alpha loops with fold-local scaling
-- Every fold scales `X` and `y` on training data only, then inverse-transforms predictions before computing MAE
+- the Optuna study is in memory for the run
+- Ridge and Lasso use explicit fold-local alpha loops
+- every fold fits its own scalers on training data only, then inverse-transforms predictions before MAE/R²
 
-### 3. Feature elimination and feature-count choice
+### 3. SHAP-driven feature elimination
 
-For non-GPlearn models, the feature-removal loop is SHAP-driven:
+For non-GPlearn models, each iteration removes exactly one feature:
 
-- coarse single-fit SHAP when the feature count is still high
-- 5-fold consensus SHAP-RFECV when the feature count is small enough
-- remove the weaker member of any highly correlated pair first, otherwise remove the globally least important feature
+- remove the weaker member of a high-correlation pair first
+- otherwise remove the globally least important feature
 
-`--min_features` is the stopping floor and defaults to `5`.
+That path continues until the configured floor is reached. `--min_features` defaults to `5`.
 
-`--force_n_features` does not skip path evaluation. It evaluates the SHAP-RFECV path down to `--min_features`, then selects the exact requested feature count from that evaluated path.
+`--force_n_features` still means “evaluate the path, then choose an exact feature count”, but `main.py` now rejects that option immediately for the default registry because the default run still includes GPlearn. Exact feature-count forcing is only valid for custom registries that exclude GPlearn.
 
-### 4. Metric roles
+### 4. Metric roles and checkpoint schema
 
-Primary final metrics:
+Final checkpoints use nested metrics:
 
-- `test_mae`
-- `test_r2`
+- `metrics.primary.final_test.test_mae`
+- `metrics.primary.final_test.test_r2`
+- `metrics.secondary.internal_cv.*`
+- `metrics.secondary.stability.*`
+- `metrics.secondary.loo.*`
 
-Secondary development-only metrics:
+Iteration checkpoints keep the development-path metrics in flat form:
 
-- `internal_cv.rkf_mae_mean/std`
-- `internal_cv.rkf_r2_mean/std`
-- `stability.mae_mean/std`
-- `loo.mae`
-- `loo.r2`
+- `metrics.internal_cv.*`
+- `metrics.stability.*`
+- `metrics.loo.*`
 
-Legacy aliases are still written for compatibility, but they are not the primary model-selection outputs anymore.
+Legacy aliases may still appear for compatibility, but current readers should prefer the current keys first and only fall back to the aliases when needed.
 
-### 5. y-randomization
+### 5. Standalone y-randomization
 
-The automatic full-pipeline y-randomization block remains disabled because of runtime cost. The supported path is the standalone script:
+Automatic full-pipeline y-randomization remains disabled in the main workflow. The supported path is `example/standalone_y_randomization.py`, which:
 
-- `example/standalone_y_randomization.py`
-
-That script:
-
-- loads already selected checkpoints
+- loads selected checkpoints
 - reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
 
-### 6. Checkpoint loading and external validation
+### 6. Checkpoint loading
 
-Checkpoint selection follows `src.external_validation.load_model()`:
+`src.external_validation.load_model()`:
 
-- search both final and iteration checkpoints
-- exact feature count required by default
-- exact final checkpoints preferred over exact iteration checkpoints
-- newest filename timestamp wins inside the chosen checkpoint class
-- nearest-match fallback is allowed only with `allow_closest=True` / `--allow-closest`
+- searches both final and iteration checkpoints
+- requires an exact feature count by default
+- prefers exact final checkpoints over exact iteration checkpoints
+- breaks ties by the filename timestamp
+- only allows nearest-match fallback with `allow_closest=True` / `--allow-closest`
 
-`example/load_checkpoint_guide.py` shows how to inspect these checkpoints safely.
+`example/load_checkpoint_guide.py` follows that same selection logic and safely formats both current and legacy metric layouts.
 
 ### 7. Applicability domain
 
@@ -146,9 +128,9 @@ Applicability-domain analysis uses:
 
 - training-set 5-fold OOF residuals
 - MAD-based residual scaling with finite fallbacks
-- descriptor-space leverage
+- leverage in descriptor space
 
-If external ground truth is absent, the Williams plot switches to a leverage-only prediction view instead of inventing residual thresholds from missing labels.
+Prediction-only mode is leverage-only when external labels are absent; there is no external `sqrt(1-h)` correction term.
 
 ## CLI arguments for `main.py`
 
@@ -156,9 +138,9 @@ If external ground truth is absent, the Williams plot switches to a leverage-onl
 |---|---:|---|
 | `--n_trials` | `100` | Optuna trials per model on the development set |
 | `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
-| `--keep_versions` | `2` | Number of recent final-model runs/checkpoint families to retain |
-| `--min_features` | `5` | Minimum feature floor for SHAP-RFECV path evaluation |
-| `--force_n_features` | `None` | Select an exact evaluated feature count instead of auto-selecting from the path |
+| `--keep_versions` | `2` | Number of recent checkpoint families to retain |
+| `--min_features` | `5` | SHAP-RFECV feature-floor for path evaluation |
+| `--force_n_features` | `None` | Exact evaluated feature count; rejected by `main.py` for the default GPlearn-containing registry |
 
 ## Output layout
 
@@ -176,13 +158,13 @@ models/
 └── optimization_<timestamp>.log
 ```
 
-Iteration checkpoints store development-only metrics. Final checkpoints add the one-time final test result, split metadata, scalers, complete merged hyperparameters, and the chosen feature order.
+Iteration checkpoints store development-path results. Final checkpoints add the one-time final-test result, split metadata, fitted scalers, merged hyperparameters, and final feature order.
 
-## Notes on reproducibility
+## Reproducibility notes
 
-- Fixed development/final split seed: `40`
-- Fixed evaluation seeds inside development utilities: `42`
-- Target values are not clipped
+- fixed development/final split seed: `40`
+- fixed development-side evaluation seeds: `42`
+- target values are not clipped
 - Matplotlib uses the `Agg` backend in the optimization workflow
 - `src/fixed_params.py` is the single source of truth for fixed model parameters
 - `src/evaluation.py` is the single source of truth for 5×5 RepeatedKFold evaluation

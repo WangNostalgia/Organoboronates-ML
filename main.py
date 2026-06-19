@@ -3,6 +3,24 @@ import argparse
 
 
 SHOW_PROGRESS_BAR = True
+DEFAULT_MODEL_NAMES = (
+    "LinearRegression",
+    "Ridge",
+    "Lasso",
+    "SVR",
+    "DecisionTree",
+    "RandomForest",
+    "GradientBoosting",
+    "XGBoost",
+    "KRR",
+    "MLP",
+    "AdaBoost",
+    "ElasticNet",
+    "KNR",
+    "LightGBM",
+    "CatBoost",
+    "GPlearn",
+)
 
 
 def configure_runtime():
@@ -169,13 +187,23 @@ def build_argument_parser():
         type=int,
         default=None,
         help="Evaluate the SHAP-RFECV path through --min_features, then select the "
-        "entry with this exact feature count instead of auto-selection.",
+        "entry with this exact feature count instead of auto-selection. main.py "
+        "rejects this for the default GPlearn-containing registry.",
     )
     return parser
 
 
 def main():
-    args = build_argument_parser().parse_args()
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    if args.force_n_features is not None and "GPlearn" in DEFAULT_MODEL_NAMES:
+        parser.error(
+            "--force_n_features is not available from main.py while the default "
+            "registry still includes GPlearn. Use the default auto-selection "
+            "path, or call iterative_optimization() with a custom registry that "
+            "excludes GPlearn."
+        )
 
     configure_runtime()
 

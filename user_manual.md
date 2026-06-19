@@ -1,6 +1,6 @@
 # User Manual
 
-This manual explains how to run the current repository as it exists in code today. For the conceptual six-stage overview, read [Pipeline.md](Pipeline.md) first.
+This manual describes the repository as it exists in code today. Read [pipeline.md](pipeline.md) first for the conceptual six-stage overview.
 
 ## 1. Environment setup
 
@@ -20,7 +20,7 @@ Alternative install:
 pip install -r requirements.txt
 ```
 
-The supported full installation includes the default model stack: XGBoost, LightGBM, CatBoost, and GPlearn in addition to the scikit-learn models.
+The supported full environment includes XGBoost, LightGBM, CatBoost, and `gplearn==0.4.2` in addition to the scikit-learn stack.
 
 ## 2. Input data format
 
@@ -32,15 +32,9 @@ Required structure:
 - one target column named `activation_energy`
 - optional identifier columns such as `sub_H` and `sub_B`
 
-`main.py` automatically:
+`main.py` automatically reads `example/B_dataset.csv`, drops all-NaN columns, keeps numeric columns, removes `activation_energy` from `X`, and uses it as `y`.
 
-- reads `example/B_dataset.csv`
-- drops all-NaN columns
-- keeps numeric columns
-- removes `activation_energy` from `X`
-- uses `activation_energy` as `y`
-
-## 3. Main training commands
+## 3. Main commands
 
 Full run:
 
@@ -54,17 +48,10 @@ Quick run:
 python main.py --n_trials 20 --min_features 5
 ```
 
-Show current CLI:
+Show CLI:
 
 ```bash
 python main.py --help
-```
-
-Notebook entry points:
-
-```bash
-jupyter notebook example/example_pic.ipynb
-jupyter notebook example/prediction_round2.ipynb
 ```
 
 Standalone y-randomization:
@@ -75,15 +62,15 @@ python example/standalone_y_randomization.py
 
 ## 4. CLI arguments
 
-| Argument | Default | What it controls |
+| Argument | Default | Meaning |
 |---|---:|---|
 | `--n_trials` | `100` | Optuna trials per model on the development set |
 | `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
 | `--keep_versions` | `2` | Number of recent checkpoint families to retain per model |
-| `--min_features` | `5` | Stopping floor for SHAP-RFECV path evaluation |
-| `--force_n_features` | `None` | Select an exact evaluated feature count after the path has been evaluated |
+| `--min_features` | `5` | SHAP-RFECV feature floor |
+| `--force_n_features` | `None` | Exact evaluated feature count; rejected by `main.py` for the default GPlearn-containing registry |
 
-`--force_n_features` is not a shortcut around feature elimination. It still evaluates the development-set SHAP-RFECV path and then selects the requested exact point from that path.
+`--force_n_features` is not a shortcut around feature elimination. It still means “evaluate the path, then choose the exact point”, but with the default registry the CLI exits immediately because GPlearn is enabled there. If you need exact feature-count forcing, call `iterative_optimization()` with a custom registry that excludes GPlearn.
 
 ## 5. What `main.py` actually does
 
@@ -91,12 +78,12 @@ python example/standalone_y_randomization.py
 
 `src.iterative_optimization.iterative_optimization()` creates one 80/20 split with `random_state=40`.
 
-- Development set (80%): all model selection activity
-- Final test set (20%): held out until the very end
+- Development set: all model-selection work
+- Final test set: held out until the very end
 
-All models share that same split, so their final test metrics are paired on the same samples.
+All default models share the same final-test rows.
 
-### Stage B: model registry
+### Stage B: default model registry
 
 The active default registry in `main.py` is:
 
@@ -117,7 +104,7 @@ The active default registry in `main.py` is:
 - CatBoost
 - GPlearn
 
-`GaussianProcessRegressor` is present in the source but commented out.
+`GaussianProcessRegressor` is present in source but commented out.
 
 ### Stage C: development-only hyperparameter selection
 
@@ -125,36 +112,28 @@ The active default registry in `main.py` is:
 
 Current behavior:
 
-- Optuna objective: internal 5-fold MAE on the development subset
+- Optuna objective: internal 5-fold MAE on development data
 - Optuna storage: in-memory study per run
-- Ridge: explicit inner-fold alpha loop
-- Lasso: explicit inner-fold alpha loop plus Optuna tuning for `tol`
-- Every fold fits feature and target scalers on training data only
-- MAE is computed after inverse-transform back to kcal/mol
+- Ridge: explicit fold-local alpha loop
+- Lasso: explicit fold-local alpha loop plus additional Optuna-managed parameters such as `tol`
+- every fold fits feature and target scalers on training data only
+- MAE and R² are computed after inverse-transform back to kcal/mol
 
 ### Stage D: SHAP-driven feature elimination
 
 For non-GPlearn models, each iteration:
 
 1. tunes on the current development feature subset
-2. records development-only metrics
+2. records development-path metrics
 3. saves an iteration checkpoint
-4. removes one feature using SHAP-RFECV logic
+4. removes one feature with SHAP-RFECV logic
 
 Removal strategy:
 
-- if a high-correlation pair is present, remove the less important member
+- if a high-correlation pair exists, remove the less important member
 - otherwise remove the globally weakest feature
 
-Mode switching:
-
-- many features: coarse single-fit SHAP
-- few features: 5-fold consensus SHAP-RFECV
-
-The loop stops when either:
-
-- remaining features reach `min_features`
-- no more features qualify for removal
+The path therefore continues until the configured floor is reached. `--min_features` defaults to `5`.
 
 ### Stage E: final model build and one-time final test
 
@@ -164,31 +143,26 @@ After path selection is finished:
 2. the chosen estimator is refit on all development rows for those features
 3. the untouched final test split is scored exactly once
 
-Primary final metrics:
+Primary final metrics live in:
 
-- `test_mae`
-- `test_r2`
+- `metrics.primary.final_test.test_mae`
+- `metrics.primary.final_test.test_r2`
 
-Secondary development-only metrics:
+Secondary development-only metrics live in:
 
-- `internal_cv.rkf_mae_mean/std`
-- `internal_cv.rkf_r2_mean/std`
-- `stability.mae_mean/std`
-- `loo.mae`
-- `loo.r2`
+- `metrics.secondary.internal_cv.*`
+- `metrics.secondary.stability.*`
+- `metrics.secondary.loo.*`
 
-The final test set is not used for:
+Iteration checkpoints use the flat development-path schema:
 
-- tuning
-- SHAP analysis
-- feature elimination
-- feature-count selection
-- LOOCV
-- 100-split stability analysis
+- `metrics.internal_cv.*`
+- `metrics.stability.*`
+- `metrics.loo.*`
+
+The final test set is never used for tuning, SHAP analysis, feature elimination, feature-count selection, LOOCV, or 100-split stability analysis.
 
 ### Stage F: saved artifacts
-
-Per-model artifacts:
 
 ```text
 models/<ModelName>/
@@ -202,20 +176,11 @@ models/<ModelName>/
 └── performance_history_<timestamp>.png
 ```
 
-The final checkpoint includes:
-
-- fitted estimator
-- fitted `scaler_X`
-- fitted `scaler_y`
-- final feature order
-- complete merged hyperparameters
-- primary and secondary metrics
-- split metadata
-- removed-feature history
+The final checkpoint includes the fitted estimator, fitted scalers, final feature order, merged hyperparameters, nested primary/secondary metrics, split metadata, and removed-feature history.
 
 ## 6. Checkpoint loading
 
-Use [example/load_checkpoint_guide.py](example/load_checkpoint_guide.py) for interactive examples, or call `src.external_validation.load_model()` directly.
+Use [example/load_checkpoint_guide.py](example/load_checkpoint_guide.py) for examples, or call `src.external_validation.load_model()` directly.
 
 Selection rules:
 
@@ -225,7 +190,7 @@ Selection rules:
 - newest filename timestamp wins inside the preferred class
 - closest-match fallback only if `allow_closest=True`
 
-This means “load 5 features” is deterministic and will not silently pick a nearby checkpoint unless you explicitly allow that.
+This keeps “load 5 features” deterministic unless you explicitly opt into nearest-match fallback.
 
 ## 7. External validation
 
@@ -245,17 +210,11 @@ Notes:
 
 - default behavior is exact feature-count loading
 - `--allow-closest` opts into nearest-match fallback
-- ensemble validation aligns members on the common original row index, not by positional truncation
+- ensemble validation aligns members on the common original row index
 
 ## 8. Applicability domain
 
 The applicability-domain CLI lives in `src/applicability_domain.py`.
-
-Example:
-
-```bash
-python src/applicability_domain.py --model SVR --n_features 5 --training example/B_dataset.csv --external external.csv
-```
 
 Current behavior:
 
@@ -266,24 +225,23 @@ Current behavior:
 
 ## 9. Standalone y-randomization
 
-The repository currently supports y-randomization as a standalone validation step, not as an automatic step inside `main.py`.
+The repository supports y-randomization as a standalone validation step, not as an automatic step inside `main.py`.
 
 `example/standalone_y_randomization.py`:
 
-- reads `example/manual_feature_selection.csv`
+- reads the configured dataset/checkpoint settings
 - loads locked checkpoints
 - uses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
 
-Before running it, edit the configuration block near the top of the script if you need a different CSV, model directory, dataset path, or permutation count.
-
-## 10. Practical reading of metrics
+## 10. How to read metrics
 
 Use the metrics like this:
 
-- `test_mae` / `test_r2`: the main final generalization result
-- internal CV metrics: development-set selection evidence
-- stability MAE: repeated split robustness inside development data
-- LOOCV metrics: sensitivity / literature-reference numbers only
+- `metrics.primary.final_test.test_mae` / `metrics.primary.final_test.test_r2`: final generalization result
+- `metrics.secondary.internal_cv.*`: development-set selection evidence
+- `metrics.secondary.stability.*`: repeated-split robustness inside development data
+- `metrics.secondary.loo.*`: sensitivity / literature-reference numbers
+- `metrics.internal_cv.*`: the flat iteration-checkpoint counterpart
 
-If a report or old notebook still shows compatibility aliases such as `mae_mean`, `mae_test_avg`, or `r2_test_avg`, treat them according to the metric-role notes in the current saved checkpoint, not according to older workflow descriptions.
+If an older checkpoint still exposes compatibility aliases such as `mae_test_avg`, `r2_test_avg`, or `mae_mean`, treat them as fallbacks rather than the primary schema.

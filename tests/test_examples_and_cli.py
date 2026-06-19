@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import io
 import os
 import re
 import subprocess
@@ -7,7 +8,9 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +95,22 @@ class CheckpointGuideFormatterTests(unittest.TestCase):
 
         self.assertEqual(value, 0.81234)
 
+    def test_metric_value_skips_none_and_nan_and_falls_through_to_later_candidates(self):
+        metrics = {
+            "test_mae": None,
+            "primary": {"final_test": {"test_mae": float("nan")}},
+            "mae_test_avg": 3.4567,
+        }
+
+        value = self.module._metric_value(
+            metrics,
+            "test_mae",
+            ("primary", "final_test", "test_mae"),
+            "mae_test_avg",
+        )
+
+        self.assertEqual(value, 3.4567)
+
     def test_format_metric_returns_na_for_missing_and_does_not_numeric_format_strings_or_none(self):
         self.assertEqual(
             self.module._format_metric({}, "test_mae", ("primary", "final_test", "test_mae")),
@@ -105,6 +124,24 @@ class CheckpointGuideFormatterTests(unittest.TestCase):
             self.module._format_metric({"test_mae": "already formatted"}, "test_mae"),
             "already formatted",
         )
+
+    def test_compare_checkpoints_does_not_render_direction_arrow_when_any_side_is_na(self):
+        info_a = {"features": ["f1"], "metrics": {"test_mae": None}}
+        info_b = {"features": ["f1"], "metrics": {"test_mae": 1.2345}}
+
+        with patch.object(
+            self.module,
+            "_load_checkpoint_info",
+            side_effect=[info_a, info_b],
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.module.compare_checkpoints("models/SVR", 1, 1)
+
+        output = buffer.getvalue()
+        self.assertIn("N/A", output)
+        self.assertNotIn("<-", output)
+        self.assertNotIn("->", output)
 
 
 class MainCliDefinitionTests(unittest.TestCase):
@@ -148,6 +185,26 @@ class MainCliDefinitionTests(unittest.TestCase):
         )
         self.assertIn("--force_n_features", completed.stdout)
 
+    def test_main_force_n_features_fails_atomically_before_runtime_setup_for_default_registry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(WORKTREE_ROOT / "main.py"),
+                    "--force_n_features",
+                    "3",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmpdir,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("GPlearn", completed.stderr)
+            self.assertFalse((Path(tmpdir) / "models").exists())
+            self.assertEqual(list(Path(tmpdir).glob("optimization_*.log")), [])
+
 
 class DependencyMetadataTests(unittest.TestCase):
     def test_dependency_files_include_default_model_packages(self):
@@ -174,10 +231,10 @@ class DependencyMetadataTests(unittest.TestCase):
                 msg=f"{package_name} missing from requirements.txt",
             )
 
-    def test_pyproject_declares_gplearn_floor_for_supported_installations(self):
+    def test_pyproject_declares_exact_gplearn_pin_for_supported_installations(self):
         pyproject_text = (WORKTREE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-        self.assertRegex(pyproject_text, r'"gplearn>=0\.4\.2"')
+        self.assertRegex(pyproject_text, r'"gplearn==0\.4\.2"')
 
 
 class ActiveDocsAndExamplesTests(unittest.TestCase):
@@ -186,8 +243,9 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
             "README.md",
             "README_CN.md",
             "user_manual.md",
-            "Pipeline.md",
             "pipeline.md",
+            "AGENTS.md",
+            "CLAUDE.md",
             "example/load_checkpoint_guide.py",
         ]
 
@@ -199,13 +257,67 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
 
         self.assertEqual(offenders, [])
 
+    def test_git_tracks_only_canonical_pipeline_markdown_and_docs_link_to_lowercase_name(self):
+        completed = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            cwd=WORKTREE_ROOT,
+            check=True,
+        )
+        tracked_files = completed.stdout.splitlines()
 
-class PipelineMirrorTests(unittest.TestCase):
-    def test_pipeline_documents_remain_identical(self):
-        uppercase = (WORKTREE_ROOT / "Pipeline.md").read_text(encoding="utf-8")
-        lowercase = (WORKTREE_ROOT / "pipeline.md").read_text(encoding="utf-8")
+        self.assertIn("pipeline.md", tracked_files)
+        self.assertNotIn("Pipeline.md", tracked_files)
 
-        self.assertEqual(uppercase, lowercase)
+        for relative_path in [
+            "README.md",
+            "README_CN.md",
+            "user_manual.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+        ]:
+            text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertNotIn("](Pipeline.md)", text, msg=relative_path)
+            self.assertIn("](pipeline.md)", text, msg=relative_path)
+
+    def test_active_docs_describe_current_metric_schema(self):
+        for relative_path in [
+            "README.md",
+            "README_CN.md",
+            "user_manual.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "pipeline.md",
+        ]:
+            text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("metrics.primary.final_test", text, msg=relative_path)
+            self.assertIn("metrics.secondary.internal_cv", text, msg=relative_path)
+            self.assertIn("metrics.secondary.stability", text, msg=relative_path)
+            self.assertIn("metrics.secondary.loo", text, msg=relative_path)
+            self.assertIn("metrics.internal_cv", text, msg=relative_path)
+
+    def test_active_docs_do_not_describe_feature_removal_as_stopping_when_no_candidate_qualifies(self):
+        for relative_path in [
+            "README.md",
+            "README_CN.md",
+            "user_manual.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "pipeline.md",
+        ]:
+            text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertNotIn("no more features qualify for removal", text, msg=relative_path)
+            self.assertNotIn("no more features to remove", text, msg=relative_path)
+
+    def test_historical_examples_are_labeled_non_authoritative(self):
+        diagnose_text = (WORKTREE_ROOT / "example/diagnose_lasso.py").read_text(encoding="utf-8")
+        improvement_text = (WORKTREE_ROOT / "example/improvement_code_examples.py").read_text(encoding="utf-8")
+
+        self.assertRegex(diagnose_text[:400], r"historical|legacy")
+        self.assertRegex(diagnose_text[:400], r"not current|non-current|non-authoritative")
+        self.assertRegex(improvement_text[:400], r"historical|conceptual")
+        self.assertRegex(improvement_text[:400], r"not authoritative|non-authoritative")
 
 
 if __name__ == "__main__":

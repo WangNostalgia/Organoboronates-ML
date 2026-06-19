@@ -30,6 +30,22 @@ from src.external_validation import load_model
 _MISSING = object()
 
 
+def _is_missing_metric_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, Real) and not isinstance(value, bool):
+        return not math.isfinite(float(value))
+    return False
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 def _metric_value(metrics: dict[str, Any] | None, *candidates: Any) -> Any:
     """
     Return the first metric value found in ordered candidates.
@@ -52,7 +68,7 @@ def _metric_value(metrics: dict[str, Any] | None, *candidates: Any) -> Any:
                     break
                 value = value[part]
 
-        if value is not _MISSING:
+        if value is not _MISSING and not _is_missing_metric_value(value):
             return value
 
     return None
@@ -281,7 +297,7 @@ def compare_checkpoints(model_dir: str, n_features_a: int, n_features_b: int) ->
         formatted_b = _format_metric(metrics_b, *candidates)
 
         better = "N/A"
-        if isinstance(value_a, Real) and isinstance(value_b, Real):
+        if _is_finite_number(value_a) and _is_finite_number(value_b):
             if direction == "lower":
                 better = "<-" if value_a <= value_b else "->"
             else:

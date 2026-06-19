@@ -1,133 +1,149 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
-## Project Overview
+## Project overview
 
-Machine learning tool for predicting organoboronate reaction activation energies (kcal/mol). Supplementary material for the Nature Communications paper "Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond" (DOI: 10.1038/s41467-025-60674-9).
+Machine-learning workflow for predicting organoboronate reaction activation energies (kcal/mol). This repository accompanies the Nature Communications paper "Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond" (DOI: 10.1038/s41467-025-60674-9).
 
-See [Pipeline.md](Pipeline.md) for a detailed conceptual explanation of the six-stage ML workflow, and [user_manual.md](user_manual.md) for step-by-step execution instructions.
+Read:
 
-## Commands
+- [pipeline.md](pipeline.md) for the conceptual workflow
+- [user_manual.md](user_manual.md) for execution steps
+- [AGENTS.md](AGENTS.md) for repository-specific agent notes
+
+## Core commands
 
 ```bash
-# Install dependencies (uv is preferred, Python 3.12+)
 uv sync
-
-# Run the full training pipeline
-python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
-
-# Run a quick test (fewer trials)
-python main.py --n_trials 20 --mae_threshold 2.0 --min_features 5
-
-# Run Jupyter notebooks for evaluation/prediction
+python main.py --n_trials 100 --min_features 5
+python main.py --n_trials 20 --min_features 5
+python main.py --help
+python example/standalone_y_randomization.py
 jupyter notebook example/example_pic.ipynb
 jupyter notebook example/prediction_round2.ipynb
-
-# Config reference: single source of truth for fixed model params
-python -c "from src.fixed_params import get_fixed_params; print(get_fixed_params(SVR))"
-```
+python -c "from sklearn.svm import SVR; from src.fixed_params import get_fixed_params; print(get_fixed_params(SVR))"
 ```
 
-### main.py arguments
+## CLI semantics
 
-| Argument | Default | Description |
-|---|---|---|
-| `--n_trials` | 100 | Optuna optimization trials per model |
-| `--mae_threshold` | 2.0 | MAE threshold for "good" model classification |
-| `--min_features` | 5 | Minimum features to retain |
-| `--n_jobs` | -1 | CPU cores (-1 = all) |
-| `--keep_versions` | 2 | Number of model versions to retain on disk |
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--n_trials` | `100` | Optuna trials per model on the development set |
+| `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
+| `--keep_versions` | `2` | Number of recent checkpoint families to retain |
+| `--min_features` | `5` | SHAP-RFECV feature floor |
+| `--force_n_features` | `None` | Exact evaluated feature count; rejected by `main.py` for the default GPlearn-containing registry |
 
-## Architecture
+`main.py` aborts before runtime setup if `--force_n_features` is requested while the default registry still includes GPlearn.
 
-### Entry point and orchestration
+## Default model registry
 
-`main.py` reads `example/B_dataset.csv`, selects numeric columns, drops the `activation_energy` column as the target, and calls `iterative_optimization()` with a dict of model classes. Only SVR, RandomForest, and KNeighborsRegressor are active by default; several others are commented out.
+The active default registry in `main.py` is:
 
-`src/iterative_optimization.py` is the core orchestration engine. Its main loop:
+- LinearRegression
+- Ridge
+- Lasso
+- SVR
+- DecisionTree
+- RandomForest
+- GradientBoosting
+- XGBoost
+- KRR
+- MLP
+- AdaBoost
+- ElasticNet
+- KNR
+- LightGBM
+- CatBoost
+- GPlearn
 
-1. Calls `hyperparameter_optimization_and_training()` to train the current model with Optuna-tuned hyperparameters
-2. Scales features (MinMaxScaler) and target (MinMaxScaler 0-100), retrains on scaled data
-3. Runs `feature_importance_analysis()` (SHAP) to get per-feature importance percentages
-4. Runs `feature_correlation_analysis()` to get the correlation matrix
-5. Runs `shap_rfecv_select_worst_feature()` (SHAP-RFECV with multi-fold CV consensus) to decide which feature to remove
-6. Removes selected features and iterates until `min_features` is reached or no more features qualify for removal
-7. After iteration: LOO validation, performance history plot/CSV, final scatter plot, saves `*_final_*.joblib`
+`GaussianProcessRegressor` is present in source but commented out by default.
 
-Each iteration saves `{ModelName}_iteration_{N}_{timestamp}.joblib` containing the model, scalers, feature list, hyperparameters, and metrics.
+## Architecture and current protocol
 
-### Hyperparameter optimization (`src/train_and_evaluate.py`)
+### Entry point
 
-The `train_and_evaluate()` function:
-- Splits data 80/20 (random_state=42)
-- Defines an Optuna `objective()` that performs Leave-One-Out CV on the training split, returning mean MAE
-- Uses `TPESampler` with `n_startup_trials=5`
-- Each model class has its own `trial.suggest_*` parameter space
-- After optimization, evaluates on 100 random train/test splits and reports average MAE
-- Optuna studies are persisted as SQLite databases: `optuna_optimization_{ModelClass}.db`
+`main.py` reads `example/B_dataset.csv`, keeps numeric columns, removes `activation_energy` from `X`, and passes the default model registry into `iterative_optimization()`.
 
-`src/hyperparameter_optimization_and_training.py` is a thin wrapper: calls `train_and_evaluate()`, then does another 80/20 split and returns the untrained model instance, scalers, splits, MAE, and best params.
+### Development/final-test split
 
-### Feature selection (`src/feature_selection.py`)
+`src/iterative_optimization.py` creates one shared 80/20 split with `random_state=40`.
 
-SHAP-RFECV with two-tier strategy:
-- **Coarse filtering** (many features): single-fit SHAP (`cv_folds=0`) for speed
-- **Fine-grained selection** (few features, ≤ max(10, min_features+3)): multi-fold CV consensus SHAP (`cv_folds=5`) for robustness
+- Development set: tuning, SHAP feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability
+- Final test set: evaluated exactly once after feature count and hyperparameters are locked
 
-Two-phase removal within each SHAP evaluation:
-1. **High correlation**: finds feature pairs with |r| > 0.8, picks the less SHAP-important one
-2. **Low importance**: if no high-correlation pairs, picks the globally least important feature
+The final test set is not part of model selection.
 
-All scaling is done internally with per-fold `MinMaxScaler` instances — no data leakage. The deprecated legacy `feature_selection()` function (threshold-based, non-SHAP) has been removed.
+### Hyperparameter tuning
 
+`src/train_and_evaluate.py` performs development-only parameter selection.
 
-### Feature importance (`src/feature_importance_analysis.py`)
+- Optuna objective: internal 5-fold MAE
+- Optuna storage: in-memory study
+- Ridge/Lasso: explicit fold-local alpha loops
+- each fold scales training data only, then inverse-transforms predictions before computing MAE/R²
 
-Uses SHAP with model-specific explainers:
-- Tree-based models (RandomForest, XGBoost, LightGBM, CatBoost, GradientBoosting, DecisionTree): `shap.TreeExplainer`
-- Linear models (LinearRegression, Ridge, Lasso, ElasticNet): `shap.LinearExplainer`
-- GPlearn, SVR, MLP, KNR, GPR, KRR: `shap.KernelExplainer` with K-means background summarization
+### Feature elimination
 
-### Data format
+For non-GPlearn models, each iteration removes exactly one feature:
 
-Input CSV must contain numeric features plus an `activation_energy` column (the target). The example data at `example/B_dataset.csv` also has `sub_H` and `sub_B` as compound identifiers (non-numeric, excluded automatically).
+1. tune on the current development feature subset
+2. save an iteration checkpoint
+3. remove the weaker member of a high-correlation pair, or otherwise the globally least important feature
 
-### Output structure
+The path continues until the `min_features` floor is reached.
 
-```
+### Metric schema
+
+Final checkpoints use:
+
+- `metrics.primary.final_test.test_mae`
+- `metrics.primary.final_test.test_r2`
+- `metrics.secondary.internal_cv.*`
+- `metrics.secondary.stability.*`
+- `metrics.secondary.loo.*`
+
+Iteration checkpoints use:
+
+- `metrics.internal_cv.*`
+- `metrics.stability.*`
+- `metrics.loo.*`
+
+Legacy aliases may still exist for compatibility, but the current schema above is authoritative.
+
+### y-randomization
+
+The automatic full-pipeline y-randomization path remains disabled. The supported route is `example/standalone_y_randomization.py`, which reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets and reports the corrected finite-permutation p-value.
+
+### Checkpoint loading
+
+`src.external_validation.load_model()`:
+
+- searches both final and iteration checkpoints
+- requires exact feature counts by default
+- prefers exact final over exact iteration
+- uses filename timestamps for deterministic tie-breaking
+- only allows nearest-match fallback with `allow_closest=True`
+
+### Applicability domain
+
+`src.applicability_domain.py` uses training-set 5-fold OOF residuals with MAD-based scaling and descriptor-space leverage. Prediction-only mode is leverage-only, with no external `sqrt(1-h)` correction.
+
+## Output structure
+
+```text
 models/
 ├── <ModelName>/
-│   ├── <ModelName>_iteration_N_<timestamp>.joblib   # Per-iteration checkpoint
-│   ├── <ModelName>_iteration_N_<timestamp>_metrics.txt
-│   ├── <ModelName>_final_<timestamp>.joblib          # Final model (after all iterations)
+│   ├── <ModelName>_iteration_<N>_<timestamp>.joblib
+│   ├── <ModelName>_iteration_<N>_<timestamp>_metrics.txt
+│   ├── <ModelName>_final_<timestamp>.joblib
 │   ├── <ModelName>_final_<timestamp>_metrics.txt
-│   ├── final_scatter_<timestamp>.png                 # Final scatter plot
-│   ├── final_scatter_<timestamp>_outliers.csv        # Outlier data (deviation >= 5)
-│   ├── performance_history_<timestamp>.csv           # Iteration-by-iteration metrics
-│   └── performance_history_<timestamp>.png           # Performance history plot
-├── optimization_<timestamp>.log                      # Full run log
-├── optuna_optimization_<ModelClass>.db               # Optuna study storage
+│   ├── final_scatter_<timestamp>.png
+│   ├── final_scatter_<timestamp>_outliers.csv
+│   ├── performance_history_<timestamp>.csv
+│   └── performance_history_<timestamp>.png
+└── optimization_<timestamp>.log
 ```
 
-### Additional scripts
-
-- `src/validation_process.py` — Generates a complete combinatorial validation dataset from `sub_H`/`sub_B` pairs, filling in feature values from known data.
-- `src/visualization.py` — `plot_scatter` with outlier detection (deviation ≥ 5.0 kcal/mol) and automatic CSV export. `plot_scatter_standard` for publication-quality output.
-- `src/fixed_params.py` — **Single source of truth** for all model fixed hyperparameters. All modules import from here.
-- `src/evaluation.py` — **Unified evaluation center** for 5×5 RepeatedKFold. `train_and_evaluate.py` and `y_randomization.py` both import from here.
-- `archive/` — Deprecated modules (`feature_filter.py`, `feature_importance_analysis.py`, `feature_correlation_analysis.py`, `model_feature_filter.py`, `evaluate_and_plot.py`) guarded by `raise DeprecationWarning`.
-
-### Key implementation notes
-
-- All random states are fixed to 42 for reproducibility
-- Target values are never clipped (activation energy has no physical upper bound)
-- Matplotlib backend is set to `Agg` in `iterative_optimization.py` before any pyplot imports
-- `src/fixed_params.py` is the **single source of truth** for all model fixed hyperparameters — every module imports from here
-- `src/evaluation.py` is the **unified evaluation center** for 5×5 RepeatedKFold — `train_and_evaluate.py` and `y_randomization.py` both import from it
-- Every fold/repeat independently fits its own `MinMaxScaler(feature_range=(0, 100))` on training data only — no data leakage
-- MAE is always computed after `inverse_transform` back to real kcal/mol
-- Deprecated modules (`feature_filter.py`, `feature_importance_analysis.py`, `feature_correlation_analysis.py`, `model_feature_filter.py`, `evaluate_and_plot.py`) live in `archive/` with `raise DeprecationWarning` guards
-- GPlearn mutation probabilities are explicitly set in `fixed_params.py` and passed through to `SymbolicRegressor`: p_crossover=0.7, p_subtree_mutation=0.1, p_hoist_mutation=0.05, p_point_mutation=0.1 (sum=0.95 ≤ 1.0)
-- GPlearn formula replacement uses `re.sub` with `\b` word boundaries to prevent X0 from matching X10, X11, etc.
-- CatBoost is classified as a tree model for SHAP (`TreeExplainer`) alongside RandomForest, XGBoost, LightGBM, etc.
+Iteration checkpoints contain development-path metrics. Final checkpoints add the one-time final-test metrics, split metadata, fitted scalers, merged hyperparameters, and selected feature order.

@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """
+historical legacy diagnostic example.
+non-authoritative and not current pipeline behavior.
+
 LassoCV 诊断脚本：排查为什么 Lasso 在 SHAP-RFECV 迭代中产生恒定不变的指标。
 
 运行方式:

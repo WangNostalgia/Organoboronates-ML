@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """
+conceptual and historical code snippets.
+non-authoritative examples; not the current pipeline implementation.
+
 ===============================================================================
 机器学习模型改进方法 — 完整代码示例
 ===============================================================================

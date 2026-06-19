@@ -18,9 +18,9 @@ uv sync
 python main.py --n_trials 100 --min_features 5
 python main.py --n_trials 20 --min_features 5
 python main.py --help
+python example/standalone_y_randomization.py
 jupyter notebook example/example_pic.ipynb
 jupyter notebook example/prediction_round2.ipynb
-python example/standalone_y_randomization.py
 python -c "from sklearn.svm import SVR; from src.fixed_params import get_fixed_params; print(get_fixed_params(SVR))"
 ```
 
@@ -33,10 +33,10 @@ python -c "from sklearn.svm import SVR; from src.fixed_params import get_fixed_p
 | `--n_trials` | `100` | Optuna trials per model on the development set |
 | `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
 | `--keep_versions` | `2` | Number of recent checkpoint families to retain |
-| `--min_features` | `5` | SHAP-RFECV stopping floor |
-| `--force_n_features` | `None` | Select an exact evaluated feature count from the SHAP-RFECV path |
+| `--min_features` | `5` | SHAP-RFECV feature floor |
+| `--force_n_features` | `None` | Exact evaluated feature count; rejected by `main.py` for the default GPlearn-containing registry |
 
-`--force_n_features` still evaluates the development feature path first; it does not bypass SHAP-RFECV.
+`--force_n_features` is only meaningful for custom registries that exclude GPlearn. `main.py` aborts before runtime setup if that flag is requested against the default registry.
 
 ## Default model registry
 
@@ -65,14 +65,14 @@ The active default registry in `main.py` is:
 
 ### Entry point
 
-`main.py` reads `example/B_dataset.csv`, keeps numeric columns, removes `activation_energy` from `X`, and calls `iterative_optimization()` with the default model registry.
+`main.py` reads `example/B_dataset.csv`, keeps numeric columns, removes `activation_energy` from `X`, and calls `iterative_optimization()` with the default registry.
 
 ### Fixed boundary between development and final test
 
 `src/iterative_optimization.py` creates one 80/20 split with `random_state=40` before entering the model loop.
 
-- Development set: tuning, SHAP feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability analysis
-- Final test set: scored exactly once after the feature set and hyperparameters are locked
+- Development set: tuning, SHAP feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability
+- Final test set: scored exactly once after feature count and hyperparameters are locked
 
 All default models share the same split.
 
@@ -83,36 +83,38 @@ All default models share the same split.
 - Optuna objective: internal 5-fold MAE
 - Optuna storage: in-memory study
 - Ridge/Lasso: explicit fold-local alpha loops
-- All folds fit their own `MinMaxScaler` instances on training data only
-- MAE is computed after inverse-transform back to kcal/mol
+- all folds fit their own `MinMaxScaler` instances on training data only
+- MAE/R² are computed after inverse-transform back to kcal/mol
 
 ### Feature elimination
 
 Non-GPlearn models iterate through SHAP-driven feature removal:
 
-1. train/tune on the current development feature subset
+1. train and tune on the current development feature subset
 2. save an iteration checkpoint
-3. use SHAP-RFECV logic to remove one feature
-4. stop at `min_features` or when no feature qualifies for removal
+3. remove exactly one feature
 
-GPlearn is a single-pass exception because genetic programming performs inherent feature selection.
+Removal priority is: weaker member of a high-correlation pair first, otherwise the globally least important feature. The path continues until the configured `min_features` floor is reached.
 
-### Metric roles
+GPlearn remains the single-pass exception because genetic programming performs its own embedded selection.
 
-Primary final metrics:
+### Metric schema
 
-- `test_mae`
-- `test_r2`
+Final checkpoints use:
 
-Secondary development-only metrics:
+- `metrics.primary.final_test.test_mae`
+- `metrics.primary.final_test.test_r2`
+- `metrics.secondary.internal_cv.*`
+- `metrics.secondary.stability.*`
+- `metrics.secondary.loo.*`
 
-- `internal_cv.rkf_mae_mean/std`
-- `internal_cv.rkf_r2_mean/std`
-- `stability.mae_mean/std`
-- `loo.mae`
-- `loo.r2`
+Iteration checkpoints use:
 
-Legacy aliases may still be stored for compatibility, but documentation and reviews should treat them according to the current primary/secondary split.
+- `metrics.internal_cv.*`
+- `metrics.stability.*`
+- `metrics.loo.*`
+
+Legacy aliases may still be stored for compatibility, but agent-facing docs and reviews should treat the current schema as authoritative.
 
 ### y-randomization
 
@@ -157,7 +159,7 @@ models/
 └── optimization_<timestamp>.log
 ```
 
-Iteration checkpoints contain development-only metrics. Final checkpoints additionally include the final one-time test result, full split metadata, fitted scalers, complete merged hyperparameters, and selected feature order.
+Iteration checkpoints contain development-path metrics. Final checkpoints additionally include the final one-time test result, split metadata, fitted scalers, merged hyperparameters, and selected feature order.
 
 ## Single sources of truth
 
