@@ -4,18 +4,22 @@
 分支：`codex/code-review-remediation`
 对比基线：`master`（merge-base `30f919b`）
 前序 final-wave 提交：`a5ca47d fix: close final review edge cases`
-最终剩余问题修复提交：`c069d43 fix: enforce exact run family retention`
+前序 family-retention 提交：`c069d43 fix: enforce exact run family retention`
+本轮最终门禁代码提交：`b860c6f fix: close final persistence and checkpoint gates`
 
 ## 1. 最终结论
 
 最终复审列出的剩余问题均已修复，并保留了分支上的既有正确改动：
 
 - `clean_old_versions()` 现在只识别当前模型目录 basename 对应的 canonical 产物。
-- `keep_versions` 在成功完成新 run 后再次执行，最终只保留最新的完整 family。
-- checkpoint 特征数 metadata 只接受非 bool 的 Python/NumPy integral。
+- `keep_versions` 在 API/helper/CLI 三层均严格要求正整数，bool 无效，非法 API 调用在 split/getcwd/logger/write 前原子失败，CLI 返回 exit code 2 且无运行时副作用。
+- history、scatter 和 outlier 成功后才写 final metrics/checkpoint；final joblib 是完整 family 的最后完成标记。
+- 无 final joblib 的 iteration/history/scatter 都按 orphan 处理；下次开头 cleanup 会删除 orphan，同时保留旧完整 families。
+- 损坏 checkpoint 的反序列化异常会记录 warning 并跳过单个文件；可读但 metadata/schema 非法的 checkpoint 仍明确抛出 `ValueError`。
+- checkpoint `features` 必须是非字符串 sequence，元素为非空字符串且唯一；`optimal_n_features` 只接受非 bool 的 Python/NumPy integral。
 - `list_available_models()` 优先读取 current nested metric schema，并兼容 current direct/legacy flat schema。
 - 重复且未引用的 `docs/superpowers/plans/2026-06-19-final-review-edge-cases.md` 已删除。
-- 本报告已按最终行为、测试数、文件清单和真实 lock 验证结果更新，文件编码为 UTF-8。
+- 本报告已按最终行为、实际测试数和文件清单更新，文件编码为 UTF-8。
 
 ## 2. 最终行为
 
@@ -44,26 +48,50 @@ escaped_model_name = re.escape(model_name)
 - `manual_notes`、备份文件、未知扩展和未知命名保持不变。
 - foreign-model checkpoint/final 保持不变，且 foreign final 不参与当前模型 retention 排序。
 - 当前模型旧 family 的 canonical joblib、metrics、history、scatter 和 outlier CSV 会一起删除。
-- 如果目录尚无 final，则只用当前模型 canonical iteration timestamp 做兼容 retention。
+- 只有存在 canonical final joblib 的 timestamp 才是完整 family。
+- 如果目录尚无 final，所有 canonical iteration/history/scatter/final-metrics 都是 orphan，cleanup 会删除它们。
 
-### 2.2 `keep_versions` 的实际运行顺序
+### 2.2 `keep_versions` 正整数与原子性
+
+`iterative_optimization()` 的首个可执行语句校验 `keep_versions`：
+
+- 接受 Python/NumPy integral 且值 `>= 1`；
+- 拒绝 `0`、负数、bool、float、字符串和 `None`；
+- 校验发生在 `train_test_split()`、`os.getcwd()`、logger 初始化和任何写入之前。
+
+`clean_old_versions()` 自身重复执行同一防御性校验。`main.py` 的
+`--keep_versions` 使用 positive-int argparse type，因此 CLI 的 `0`/`-1`
+在 runtime setup 前以 exit code 2 失败，不创建 `models/` 或 optimization log。
+
+### 2.3 完成标记与实际运行顺序
 
 训练开始前仍保留一次清理，用于处理既有旧 family/orphan。
 
-新 run 完成以下写入后，再执行一次：
+新 run 的写入顺序为：
 
-```python
-clean_old_versions(model_dir, keep_versions)
-```
+1. performance history PNG；
+2. performance history CSV；
+3. final scatter，以及存在 outlier 时对应的 outlier CSV；
+4. final metrics；
+5. final joblib（最后的完整 family 标记）；
+6. `clean_old_versions(model_dir, keep_versions)`。
 
-第二次清理位于 final joblib、final metrics 和 `plot_scatter()` 成功返回之后。结果是：
+结果是：
 
 - 预置两个 family、完成一个新 run 且 `keep_versions=2` 时，只剩最新两个完整 family。
-- 如果 scatter 或此前的最终写入失败，第二次清理不会执行，旧完整 family 不会被未完成 run 淘汰。
+- 如果 scatter 失败，本次 timestamp 不会留下 final joblib/final metrics，且末尾 cleanup 不执行。
+- 失败 run 可能暂留 iteration/history orphan；下一次开头 cleanup 会删除这些 orphan，同时旧两个完整 family 保持不变。
 
-### 2.3 严格的 checkpoint 特征数 metadata
+### 2.4 严格的 checkpoint features schema 与特征数 metadata
 
-`_loaded_feature_count()` 以 `len(features)` 为真实值。
+`_loaded_feature_count()` 统一执行 schema 和 metadata 校验，并以
+`len(features)` 为真实值。
+
+`features` 必须：
+
+- 是非字符串 `Sequence`（当前写入格式为 list）；
+- 每一项都是非空、非纯空白字符串；
+- 特征名唯一。
 
 `optimal_n_features` 存在时：
 
@@ -73,13 +101,23 @@ clean_old_versions(model_dir, keep_versions)
 - 拒绝字符串及其他可被 `int()` 强制转换的类型。
 - metadata 与 `len(features)` 不一致时同样拒绝。
 
-所有无效类型或不一致均抛出统一 `ValueError`，消息包含：
+所有无效 `optimal_n_features` 类型或不一致均抛出统一 `ValueError`，消息包含：
 
 - checkpoint filepath；
 - metadata 的 `repr`；
 - 实际 `len(features)`。
 
-### 2.4 模型列表 metric schema 优先级
+### 2.5 损坏 checkpoint 的隔离
+
+`_discover_model_checkpoints()` 只在 `joblib.load()` 周围捕获明确的
+反序列化损坏异常（EOF、pickle、struct、zlib），记录包含路径和异常类型的
+warning 后跳过该文件。
+
+- 健康 final 与截断 iteration 并存时，discovery/list/load 继续使用健康 final。
+- 如果 canonical checkpoints 全部损坏，选择层按正常的 “No final or iteration checkpoints found” 路径失败。
+- 成功反序列化后发生的 features schema 或 `optimal_n_features` 不一致不在捕获范围内，继续明确抛出包含路径的 `ValueError`。
+
+### 2.6 模型列表 metric schema 优先级
 
 `list_available_models()` 对 MAE/R² 分别按以下顺序读取首个非 `None` 值：
 
@@ -90,7 +128,7 @@ clean_old_versions(model_dir, keep_versions)
 
 current nested schema 因此不会再被 legacy alias 覆盖。
 
-### 2.5 文档清理
+### 2.7 文档清理
 
 本分支新引入但重复、未引用的：
 
@@ -109,6 +147,10 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 | 异常路径 | 增加保护测试，验证 scatter 失败时旧 family 不被清理 | 通过 |
 | strict Integral metadata | 1 failed、1 passed；`2.9`、`'2'`、`True` 可被旧 `int()` 接受 | metadata 相关 3 passed |
 | 模型列表 schema | 2 failed；nested current 被 legacy 覆盖，direct/flat current 得到 NaN | 2 passed |
+| `keep_versions` 正整数 | API/helper/CLI 新测试失败；非法值进入 split/runtime | API/helper/CLI 原子性测试通过 |
+| scatter 后完成标记 | 失败 run 仍留下 final joblib/metrics | 失败 run 无 final，后续 cleanup 只删 orphan |
+| 损坏 checkpoint | 截断 iteration 阻断健康 final discovery/list/load | 损坏文件 warning+skip；全损坏走 No checkpoints |
+| features schema | string、非 str 项、空项、重复项可通过 `len()` | 统一 `ValueError` 且包含 checkpoint path |
 
 新增/强化测试覆盖：
 
@@ -116,9 +158,12 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 - manual notes、unknown files、foreign checkpoint 保留。
 - canonical final/iteration joblib、metrics、history、scatter、outlier CSV。
 - lightweight 新 run 的两个完整 family retention。
-- scatter 异常时不做完成后清理。
+- scatter 异常时无 final joblib/metrics、不做完成后清理；显式后续 cleanup 保留旧两个完整 family 并删除失败 run orphan。
 - `2.9`、`'2'`、bool、Python int、NumPy integer。
 - nested current、direct current、flat current、legacy flat metrics。
+- API/helper 的 `keep_versions` 非法值与 CLI `0`/`-1`。
+- 有效 final + 截断 iteration、全部 checkpoint 损坏。
+- features 为字符串、包含非字符串、空/空白名称、重复名称。
 
 ## 4. 最终验证
 
@@ -128,12 +173,7 @@ docs/superpowers/plans/2026-06-19-final-review-edge-cases.md
 python -m pytest tests/test_iterative_boundary.py tests/test_external_validation.py tests/test_applicability_domain.py tests/test_examples_and_cli.py tests/test_y_randomization.py -q
 ```
 
-结果：`68 passed in 5.37s`
-
-其中：
-
-- `tests/test_iterative_boundary.py`：`14 passed`
-- `tests/test_external_validation.py`：`20 passed`
+结果：`74 passed in 6.05s`
 
 ### 4.2 全套 pytest
 
@@ -141,7 +181,7 @@ python -m pytest tests/test_iterative_boundary.py tests/test_external_validation
 python -m pytest -q
 ```
 
-结果：`83 passed in 7.84s`
+结果：`89 passed in 8.90s`
 
 ### 4.3 unittest
 
@@ -149,9 +189,10 @@ python -m pytest -q
 python -m unittest discover -s tests -q
 ```
 
-结果：`Ran 83 tests in 5.634s`，`OK`。
+结果：`Ran 89 tests in 6.646s`，`OK`。
 
-输出中的奇异矩阵 pseudo-inverse fallback 是预期应用日志，不是测试 warning/failure。
+输出中的奇异矩阵 pseudo-inverse fallback、损坏 checkpoint skip warning
+均为测试覆盖的预期应用日志，不是测试失败。
 
 ### 4.4 编译、导入与 CLI
 
@@ -168,6 +209,7 @@ python src/external_validation.py --help
 ### 4.5 diff 与静态检查
 
 - `git diff --check`：exit code 0，无 whitespace error。
+- AST/源码顺序断言确认 `keep_versions` 是 `iterative_optimization()` 的首个可执行校验，且写入顺序为 scatter → final metrics → final joblib → cleanup。
 - Windows Git 仅提示工作区文件未来可能进行 LF→CRLF 转换。
 - ensemble 实现不再命中：
   - `all_predictions[label]`
@@ -178,18 +220,19 @@ python src/external_validation.py --help
 
 ### 4.6 `uv.lock`
 
-主代理已使用真实 `uv 0.11.22` 执行 lock check，结果通过：
+前序复审曾使用真实 `uv 0.11.22` 执行 lock check并记录：
 
 ```text
 Resolved 77 packages
 ```
 
-因此：
+本轮当前 Anaconda shell 中 `uv` 不在 PATH，`python -m uv` 也不可用，因此
+未重复执行 lock check。本轮代码/报告提交均未修改 `uv.lock`。前序结论保持为：
 
 - `uv.lock` 已经过 resolver 验证。
 - greenlet 的 s390x wheel 差异保留为 resolver 结果。
 - 未手工恢复或伪造这些 wheel 条目。
-- 不再将 lock 状态描述为“环境无 uv、未检查”。
+- 本轮不把前序验证冒充为当前 shell 的重复验证。
 
 ## 5. 最终修改文件清单
 
@@ -231,17 +274,18 @@ Resolved 77 packages
 34. `user_manual.md`
 35. `uv.lock`
 
-本次最终剩余问题的代码提交 `c069d43` 修改 4 个文件：
+本轮最终门禁代码提交 `b860c6f` 修改 6 个文件：
 
+- `main.py`
 - `src/iterative_optimization.py`
 - `src/external_validation.py`
+- `tests/test_examples_and_cli.py`
 - `tests/test_iterative_boundary.py`
 - `tests/test_external_validation.py`
 
-后续 documentation 提交包含：
+本轮报告提交只更新：
 
-- 删除 `docs/superpowers/plans/2026-06-19-final-review-edge-cases.md`
-- 更新 `code-review-report-new.md`
+- `code-review-report-new.md`
 
 ## 6. 遗留关注项
 
@@ -249,4 +293,4 @@ Resolved 77 packages
 - CatBoost、LightGBM、XGBoost、GPlearn 等可选包的全部真实训练组合仍需后续长跑验证。
 - timestamp 仍为秒级；同一模型被两个进程在同一秒并发启动时仍可能命名冲突。
 - 非 canonical 历史 checkpoint 会被发现逻辑忽略；需要使用时应先迁移并校验 metadata。
-- `keep_versions` 的 family 完整性由成功完成后的第二次清理保证；进程被强制终止时可能留下未完成产物，但不会在该失败调用中触发完成后清理。
+- 进程在 final joblib 完成标记前被强制终止时可能留下 canonical orphan；下一次开头 cleanup 会删除它们。
