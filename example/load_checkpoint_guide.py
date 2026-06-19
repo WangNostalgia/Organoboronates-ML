@@ -1,310 +1,345 @@
 # -*- coding: utf-8 -*-
 """
-===============================================================================
-  SHAP-RFECV Checkpoint 使用指南
-===============================================================================
+Checkpoint loading guide for SHAP-RFECV training outputs.
 
-训练完成后，每个模型在 models/<ModelName>/ 目录下保存了两种 .joblib 文件：
+This example mirrors the selection rules implemented in
+``src.external_validation.load_model()``:
 
-  1. *_iteration_N_<timestamp>.joblib  — 每轮迭代的模型快照（含该轮的特征集、所有指标）
-  2. *_final_<timestamp>.joblib        — 最终模型（自动选择或手动指定的最优特征集）
-
-本文件展示如何加载、检查和手动选择任意 checkpoint。
-所有代码均独立运行，不修改项目源代码。
-===============================================================================
+- search both final and iteration checkpoints
+- require an exact feature count by default
+- prefer exact final checkpoints over exact iteration checkpoints
+- break ties by newest filename timestamp (YYYYMMDD_HHMMSS)
+- only allow nearest-match loading when ``allow_closest=True``
 """
 
-import joblib
-import pandas as pd
-import numpy as np
-import os
+from __future__ import annotations
+
 import glob
+import math
+import os
+from numbers import Real
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from src.external_validation import load_model
 
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  示例 1：查看某个模型目录下有哪些 checkpoint                             ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+_MISSING = object()
 
-def list_checkpoints(model_dir):
+
+def _metric_value(metrics: dict[str, Any] | None, *candidates: Any) -> Any:
     """
-    列出某个模型目录下所有可用的 checkpoint 文件。
+    Return the first metric value found in ordered candidates.
 
-    Usage:
-        list_checkpoints('models/SVR')
+    Each candidate may be either:
+    - a top-level string key, or
+    - a tuple/list path for nested dictionaries
     """
-    # 迭代 checkpoint
-    iter_files = sorted(glob.glob(os.path.join(model_dir, '*_iteration_*.joblib')))
-    # 最终模型
-    final_files = sorted(glob.glob(os.path.join(model_dir, '*_final_*.joblib')))
-
-    print(f"\n{'='*60}")
-    print(f"  Checkpoints in: {model_dir}")
-    print(f"{'='*60}")
-
-    if final_files:
-        print(f"\n  ★ Final model (auto-selected or forced):")
-        for f in final_files:
-            info = joblib.load(f)
-            print(f"    {os.path.basename(f)}")
-            print(f"    Features ({len(info['features'])}): {info['features']}")
-            print(f"    Metrics: MAE_mean={info['metrics'].get('mae_mean','?'):.4f}, "
-                  f"R²_test={info['metrics'].get('r2_test','?'):.4f}, "
-                  f"R²_LOO={info['metrics'].get('r2_loo','?'):.4f}")
-
-    if iter_files:
-        print(f"\n  Per-iteration checkpoints ({len(iter_files)} total):")
-        for f in iter_files:
-            info = joblib.load(f)
-            n_feat = len(info['features'])
-            removed = info.get('removed_features', [])
-            last_removed = removed[-1] if removed else 'Initial'
-            print(f"    {os.path.basename(f):<60s} "
-                  f"features={n_feat:2d}  last_removed='{last_removed}'")
-    else:
-        print("  (No iteration checkpoints found)")
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  示例 2：加载最终模型并预测                                              ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def load_final_model(model_dir):
-    """
-    加载自动选择（或强制指定）的最优模型，用于预测新数据。
-
-    Usage:
-        model, scaler_X, scaler_y, features = load_final_model('models/SVR')
-
-        # 预测新数据
-        X_new = pd.read_csv('new_data.csv')
-        X_new = X_new[features]  # 只用最终选定的特征
-        X_scaled = scaler_X.transform(X_new)
-        y_pred_scaled = model.predict(X_scaled)
-        y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
-    """
-    final_files = sorted(glob.glob(os.path.join(model_dir, '*_final_*.joblib')))
-    if not final_files:
-        raise FileNotFoundError(f"No final model found in {model_dir}")
-
-    # 取最新的（如果有多个，按时间戳排序取最后一个）
-    info = joblib.load(final_files[-1])
-
-    model = info['model']
-    scaler_X = info['scaler_X']
-    scaler_y = info['scaler_y']
-    features = info['features']
-
-    print(f"\n  Loaded final model from: {os.path.basename(final_files[-1])}")
-    print(f"  Features ({len(features)}): {features}")
-    print(f"  Selection mode: {'forced' if info.get('force_n_features') else 'auto'}")
-    print(f"  Optimal N features: {info.get('optimal_n_features', '?')}")
-    for k, v in info['metrics'].items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
-
-    # 打印 SHAP-RFECV 路径（如果存在）
-    path = info.get('shap_rfecv_path_summary')
-    if path:
-        print(f"\n  SHAP-RFECV Path:")
-        print(f"  {'Feat':<5} {'RKfold MAE':<14} {'RKfold R²':<12} "
-              f"{'LOOCV R²':<10} {'LOOCV MAE':<10}")
-        print(f"  {'-'*54}")
-        for e in path:
-            print(f"  {e['n_features']:<5} {e['rkf_mae_mean']:<14.4f} "
-                  f"{e['rkf_r2_mean']:<12.4f} {e['loo_r2']:<10.4f} "
-                  f"{e['loo_mae']:<10.4f}")
-
-    return model, scaler_X, scaler_y, features
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  示例 3：手动选择特定特征数的 checkpoint（覆盖自动选择）                 ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def load_by_feature_count(model_dir, target_n_features):
-    """
-    当你通过 SHAP-RFECV Path Summary 发现某个特征数（比如 5）的综合表现
-    比自动选择（比如 7）更好时，用此函数加载对应特征数的 checkpoint。
-
-    Usage:
-        model, scaler_X, scaler_y, features = load_by_feature_count('models/SVR', 5)
-    """
-    import re
-
-    iter_files = sorted(glob.glob(os.path.join(model_dir, '*_iteration_*.joblib')))
-
-    # 遍历所有迭代 checkpoint，找到特征数匹配的那个
-    candidates = []
-    for f in iter_files:
-        info = joblib.load(f)
-        n_feat = len(info['features'])
-        if n_feat == target_n_features:
-            candidates.append((f, info))
-
-    if not candidates:
-        # 如果恰好没有这个特征数的 checkpoint，找最接近的
-        print(f"  ⚠ No checkpoint with exactly {target_n_features} features.")
-        by_distance = []
-        for f in iter_files:
-            info = joblib.load(f)
-            by_distance.append((abs(len(info['features']) - target_n_features), f, info))
-        by_distance.sort()
-        closest_dist, closest_f, closest_info = by_distance[0]
-        print(f"  Using closest: {len(closest_info['features'])} features "
-              f"(file: {os.path.basename(closest_f)})")
-        candidates = [(closest_f, closest_info)]
-
-    # 如果多个 checkpoint 特征数相同（不同迭代被移除的特征不同），
-    # 取 MAE 最低的那个
-    best_f, best_info = min(candidates,
-                            key=lambda x: x[1]['metrics'].get('mae_mean', float('inf')))
-
-    model = best_info['model']
-    scaler_X = best_info['scaler_X']
-    scaler_y = best_info['scaler_y']
-    features = best_info['features']
-
-    print(f"\n  ★ Manually selected: {len(features)} features")
-    print(f"  ★ Source: {os.path.basename(best_f)}")
-    print(f"  ★ Features: {features}")
-    m = best_info['metrics']
-    print(f"  ★ Metrics: MAE={m.get('mae_mean','?'):.4f}, "
-          f"R²_test={m.get('r2_test','?'):.4f}, "
-          f"MAE_test={m.get('mae_test','?'):.4f}")
-    print(f"\n  (Compare this with the auto-selected final model to confirm")
-    print(f"   your manual choice is indeed better for your criteria.)")
-
-    return model, scaler_X, scaler_y, features
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  示例 4：对比两个 checkpoint（自动选择 vs 手动选择）                     ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def compare_checkpoints(model_dir, n_features_a, n_features_b):
-    """
-    并排对比两个不同特征数 checkpoint 的全部指标，帮助你做出手动选择决策。
-
-    Usage:
-        compare_checkpoints('models/SVR', 7, 5)
-    """
-    print(f"\n{'='*80}")
-    print(f"  Manual Comparison: {n_features_a} features vs {n_features_b} features")
-    print(f"{'='*80}")
-
-    models_info = {}
-    iter_files = sorted(glob.glob(os.path.join(model_dir, '*_iteration_*.joblib')))
-
-    for target_n in [n_features_a, n_features_b]:
-        best_f, best_info = None, None
-        best_mae = float('inf')
-        for f in iter_files:
-            info = joblib.load(f)
-            if len(info['features']) == target_n:
-                mae = info['metrics'].get('mae_mean', float('inf'))
-                if mae < best_mae:
-                    best_mae = mae
-                    best_f, best_info = f, info
-        models_info[target_n] = (best_f, best_info)
-
-    # 打印对比表
-    metric_names = ['mae_mean', 'r2_test', 'mae_test', 'rkf_mae_mean',
-                    'rkf_mae_std', 'rkf_r2_mean', 'loo_r2', 'loo_mae']
-    metric_labels = ['100-spl MAE', 'Test R²', 'Test MAE',
-                     'RKfold MAE', 'RKfold MAE std', 'RKfold R²',
-                     'LOOCV R²', 'LOOCV MAE']
-
-    print(f"\n  {'Metric':<20} {str(n_features_a)+' features':>20} {str(n_features_b)+' features':>20} {'Better':>8}")
-    print(f"  {'-'*70}")
-    for mname, mlabel in zip(metric_names, metric_labels):
-        val_a = models_info[n_features_a][1]['metrics'].get(mname)
-        val_b = models_info[n_features_b][1]['metrics'].get(mname)
-        if val_a is None or val_b is None:
-            continue
-        # MAE 类指标：越低越好；R² 类：越高越好
-        if 'mae' in mname.lower() or 'std' in mname.lower():
-            better = '<-' if val_a <= val_b else '->'
-        else:
-            better = '<-' if val_a >= val_b else '->'
-        print(f"  {mlabel:<20} {val_a:>20.4f} {val_b:>20.4f} {better:>8}")
-
-    # 打印特征列表
-    print(f"\n  Features ({n_features_a}): {models_info[n_features_a][1]['features']}")
-    print(f"  Features ({n_features_b}): {models_info[n_features_b][1]['features']}")
-    # 差异
-    set_a = set(models_info[n_features_a][1]['features'])
-    set_b = set(models_info[n_features_b][1]['features'])
-    print(f"  Only in {n_features_a}: {set_a - set_b}")
-    print(f"  Only in {n_features_b}: {set_b - set_a}")
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  示例 5：用选定模型预测新数据（完整流程）                                 ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def predict_with_checkpoint(model_dir, csv_path, n_features=None):
-    """
-    用指定特征数的 checkpoint 对新数据进行预测。
-
-    Usage:
-        # 用自动选择的最终模型预测
-        predict_with_checkpoint('models/SVR', 'new_data.csv')
-
-        # 用 5 特征的 checkpoint 预测
-        predict_with_checkpoint('models/SVR', 'new_data.csv', n_features=5)
-    """
-    # 1. 加载模型
-    if n_features is not None:
-        model, scaler_X, scaler_y, features = load_by_feature_count(model_dir, n_features)
-    else:
-        model, scaler_X, scaler_y, features = load_final_model(model_dir)
-
-    # 2. 加载新数据
-    data = pd.read_csv(csv_path)
-    print(f"\n  New data: {len(data)} samples")
-
-    # 3. 检查特征列是否存在
-    missing = set(features) - set(data.columns)
-    if missing:
-        print(f"  ⚠ Missing columns in new data: {missing}")
-        print(f"  Cannot proceed without these features.")
+    if not isinstance(metrics, dict):
         return None
 
-    # 4. 预测
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            value = metrics.get(candidate, _MISSING)
+        else:
+            value = metrics
+            for part in candidate:
+                if not isinstance(value, dict) or part not in value:
+                    value = _MISSING
+                    break
+                value = value[part]
+
+        if value is not _MISSING:
+            return value
+
+    return None
+
+
+def _format_metric(
+    metrics: dict[str, Any] | None,
+    *candidates: Any,
+    precision: int = 4,
+) -> str:
+    """
+    Format a metric safely for console output.
+
+    - numeric finite values -> fixed precision
+    - strings -> returned unchanged
+    - missing / None / NaN -> ``N/A``
+    """
+    value = _metric_value(metrics, *candidates)
+    if value is None:
+        return "N/A"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Real) and not isinstance(value, bool):
+        numeric = float(value)
+        if math.isfinite(numeric):
+            return f"{numeric:.{precision}f}"
+        return "N/A"
+    return str(value)
+
+
+def _print_metric_line(label: str, metrics: dict[str, Any] | None, *candidates: Any) -> None:
+    print(f"  {label:<18}: {_format_metric(metrics, *candidates)}")
+
+
+def _extract_model_context(model_dir: str) -> tuple[str, str]:
+    model_dir = os.path.normpath(model_dir)
+    model_name = os.path.basename(model_dir)
+    models_dir = os.path.dirname(model_dir) or "."
+    return model_name, models_dir
+
+
+def _load_checkpoint_info(model_dir: str, n_features: int | None = None, allow_closest: bool = False) -> dict[str, Any]:
+    model_name, models_dir = _extract_model_context(model_dir)
+    return load_model(
+        model_name=model_name,
+        n_features=n_features,
+        models_dir=models_dir,
+        allow_closest=allow_closest,
+    )
+
+
+def _print_summary(model_info: dict[str, Any]) -> None:
+    metrics = model_info.get("metrics", {})
+    features = model_info.get("features", [])
+
+    print(f"  Loaded from: {os.path.basename(model_info.get('_loaded_from', '?'))}")
+    print(f"  Checkpoint type: {model_info.get('_checkpoint_type', 'unknown')}")
+    print(
+        f"  Requested features: {model_info.get('_requested_n_features', 'latest')} | "
+        f"actual features: {model_info.get('_actual_n_features', len(features))}"
+    )
+    print(f"  Features ({len(features)}): {features}")
+    _print_metric_line(
+        "Final Test MAE",
+        metrics,
+        "test_mae",
+        ("primary", "final_test", "test_mae"),
+        "mae_test_avg",
+        "mae_test",
+    )
+    _print_metric_line(
+        "Final Test R²",
+        metrics,
+        "test_r2",
+        ("primary", "final_test", "test_r2"),
+        "r2_test_avg",
+        "r2_test",
+    )
+    _print_metric_line(
+        "Internal CV MAE",
+        metrics,
+        ("secondary", "internal_cv", "rkf_mae_mean"),
+        ("internal_cv", "rkf_mae_mean"),
+        "rkf_mae_mean",
+        "rkf_mae_opt_mean",
+    )
+    _print_metric_line(
+        "Internal CV R²",
+        metrics,
+        ("secondary", "internal_cv", "rkf_r2_mean"),
+        ("internal_cv", "rkf_r2_mean"),
+        "rkf_r2_mean",
+        "rkf_r2_opt_mean",
+    )
+    _print_metric_line(
+        "100-split MAE",
+        metrics,
+        ("secondary", "stability", "mae_mean"),
+        ("stability", "mae_mean"),
+        "mae_mean",
+    )
+    _print_metric_line(
+        "LOOCV MAE",
+        metrics,
+        ("secondary", "loo", "mae"),
+        ("loo", "mae"),
+        "loo_mae",
+        "mae_loo_avg",
+    )
+    _print_metric_line(
+        "LOOCV R²",
+        metrics,
+        ("secondary", "loo", "r2"),
+        ("loo", "r2"),
+        "loo_r2",
+        "r2_loo_avg",
+    )
+
+
+def list_checkpoints(model_dir: str) -> None:
+    """
+    List final and iteration checkpoints in ``models/<ModelName>/``.
+
+    Usage:
+        list_checkpoints("models/SVR")
+    """
+    iteration_files = sorted(glob.glob(os.path.join(model_dir, "*_iteration_*.joblib")))
+    final_files = sorted(glob.glob(os.path.join(model_dir, "*_final_*.joblib")))
+
+    print(f"\n{'=' * 72}")
+    print(f"  Checkpoints in: {model_dir}")
+    print(f"{'=' * 72}")
+
+    if final_files:
+        print("\n  Final checkpoints:")
+        for path in final_files:
+            info = joblib.load(path)
+            metrics = info.get("metrics", {})
+            print(f"    {os.path.basename(path)}")
+            print(f"      Features ({len(info.get('features', []))}): {info.get('features', [])}")
+            print(
+                "      Final Test MAE / R²: "
+                f"{_format_metric(metrics, 'test_mae', ('primary', 'final_test', 'test_mae'), 'mae_test_avg', 'mae_test')} / "
+                f"{_format_metric(metrics, 'test_r2', ('primary', 'final_test', 'test_r2'), 'r2_test_avg', 'r2_test')}"
+            )
+
+    if iteration_files:
+        print(f"\n  Iteration checkpoints ({len(iteration_files)} total):")
+        for path in iteration_files:
+            info = joblib.load(path)
+            removed = info.get("removed_features", [])
+            last_removed = removed[-1] if removed else "Initial"
+            metrics = info.get("metrics", {})
+            print(f"    {os.path.basename(path)}")
+            print(
+                f"      Features={len(info.get('features', []))} | "
+                f"last removed={last_removed} | "
+                f"Internal CV MAE={_format_metric(metrics, ('internal_cv', 'rkf_mae_mean'), 'rkf_mae_mean', 'rkf_mae_opt_mean')}"
+            )
+    else:
+        print("\n  (No iteration checkpoints found)")
+
+
+def load_final_model(model_dir: str):
+    """
+    Load the newest preferred final checkpoint for prediction.
+
+    Usage:
+        model, scaler_X, scaler_y, features = load_final_model("models/SVR")
+    """
+    info = _load_checkpoint_info(model_dir)
+    print("\n  Final checkpoint selection summary")
+    _print_summary(info)
+    return info["model"], info["scaler_X"], info["scaler_y"], info["features"]
+
+
+def load_by_feature_count(model_dir: str, target_n_features: int, allow_closest: bool = False):
+    """
+    Load a checkpoint by desired feature count.
+
+    By default this requires an exact feature count. Set ``allow_closest=True``
+    only when you explicitly want nearest-match fallback.
+    """
+    info = _load_checkpoint_info(
+        model_dir,
+        n_features=target_n_features,
+        allow_closest=allow_closest,
+    )
+    print("\n  Feature-count checkpoint selection summary")
+    _print_summary(info)
+    return info["model"], info["scaler_X"], info["scaler_y"], info["features"]
+
+
+def compare_checkpoints(model_dir: str, n_features_a: int, n_features_b: int) -> None:
+    """
+    Compare two exact feature-count checkpoints side by side.
+
+    Usage:
+        compare_checkpoints("models/SVR", 7, 5)
+    """
+    info_a = _load_checkpoint_info(model_dir, n_features=n_features_a)
+    info_b = _load_checkpoint_info(model_dir, n_features=n_features_b)
+    metrics_a = info_a.get("metrics", {})
+    metrics_b = info_b.get("metrics", {})
+
+    rows = [
+        ("Final Test MAE", ("test_mae", ("primary", "final_test", "test_mae"), "mae_test_avg", "mae_test"), "lower"),
+        ("Final Test R²", ("test_r2", ("primary", "final_test", "test_r2"), "r2_test_avg", "r2_test"), "higher"),
+        ("Internal CV MAE", (("secondary", "internal_cv", "rkf_mae_mean"), ("internal_cv", "rkf_mae_mean"), "rkf_mae_mean", "rkf_mae_opt_mean"), "lower"),
+        ("Internal CV R²", (("secondary", "internal_cv", "rkf_r2_mean"), ("internal_cv", "rkf_r2_mean"), "rkf_r2_mean", "rkf_r2_opt_mean"), "higher"),
+        ("100-split MAE", (("secondary", "stability", "mae_mean"), ("stability", "mae_mean"), "mae_mean"), "lower"),
+        ("LOOCV MAE", (("secondary", "loo", "mae"), ("loo", "mae"), "loo_mae", "mae_loo_avg"), "lower"),
+        ("LOOCV R²", (("secondary", "loo", "r2"), ("loo", "r2"), "loo_r2", "r2_loo_avg"), "higher"),
+    ]
+
+    print(f"\n{'=' * 84}")
+    print(f"  Manual comparison: {n_features_a} features vs {n_features_b} features")
+    print(f"{'=' * 84}")
+    print(f"  {'Metric':<18} {f'{n_features_a} features':>18} {f'{n_features_b} features':>18} {'Better':>10}")
+    print(f"  {'-' * 70}")
+
+    for label, candidates, direction in rows:
+        value_a = _metric_value(metrics_a, *candidates)
+        value_b = _metric_value(metrics_b, *candidates)
+        formatted_a = _format_metric(metrics_a, *candidates)
+        formatted_b = _format_metric(metrics_b, *candidates)
+
+        better = "N/A"
+        if isinstance(value_a, Real) and isinstance(value_b, Real):
+            if direction == "lower":
+                better = "<-" if value_a <= value_b else "->"
+            else:
+                better = "<-" if value_a >= value_b else "->"
+
+        print(f"  {label:<18} {formatted_a:>18} {formatted_b:>18} {better:>10}")
+
+    set_a = set(info_a.get("features", []))
+    set_b = set(info_b.get("features", []))
+    print(f"\n  Features ({n_features_a}): {info_a.get('features', [])}")
+    print(f"  Features ({n_features_b}): {info_b.get('features', [])}")
+    print(f"  Only in {n_features_a}: {sorted(set_a - set_b)}")
+    print(f"  Only in {n_features_b}: {sorted(set_b - set_a)}")
+
+
+def predict_with_checkpoint(model_dir: str, csv_path: str, n_features: int | None = None, allow_closest: bool = False):
+    """
+    Predict on new data with either the latest final checkpoint or a selected
+    feature-count checkpoint.
+    """
+    if n_features is None:
+        info = _load_checkpoint_info(model_dir)
+    else:
+        info = _load_checkpoint_info(
+            model_dir,
+            n_features=n_features,
+            allow_closest=allow_closest,
+        )
+
+    data = pd.read_csv(csv_path)
+    features = info["features"]
+    missing = sorted(set(features) - set(data.columns))
+    if missing:
+        raise ValueError(f"Missing required feature columns: {missing}")
+
     X_new = data[features]
-    X_scaled = scaler_X.transform(X_new)
-    y_pred_scaled = model.predict(X_scaled)
-    y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+    X_scaled = info["scaler_X"].transform(X_new)
+    y_pred_scaled = np.asarray(info["model"].predict(X_scaled)).reshape(-1, 1)
+    y_pred = info["scaler_y"].inverse_transform(y_pred_scaled).ravel()
 
-    # 5. 附加预测结果到原数据
-    data['predicted_activation_energy'] = y_pred
+    result = data.copy()
+    result["predicted_activation_energy"] = y_pred
 
-    # 6. 保存
-    out_path = csv_path.replace('.csv', f'_predicted_{len(features)}feat.csv')
-    data.to_csv(out_path, index=False)
-    print(f"  Predictions saved to: {out_path}")
-    print(f"  Predicted range: {y_pred.min():.2f} ~ {y_pred.max():.2f} kcal/mol")
+    out_path = csv_path.replace(".csv", f"_predicted_{len(features)}feat.csv")
+    result.to_csv(out_path, index=False)
 
-    return data
+    print("\n  Prediction summary")
+    _print_summary(info)
+    print(f"  New data rows: {len(result)}")
+    print(f"  Output file: {out_path}")
+    print(f"  Prediction range: {y_pred.min():.2f} to {y_pred.max():.2f} kcal/mol")
+    return result
 
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  交互式使用示例（取消注释即可运行）                                       ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+if __name__ == "__main__":
+    list_checkpoints("models/SVR")
 
-if __name__ == '__main__':
-    # ── 示例：查看 SVR 的所有 checkpoint ──
-    list_checkpoints('models/SVR')
-
-    # ── 示例：加载自动选择的最终模型 ──
-    # model, sX, sY, feats = load_final_model('models/SVR')
-
-    # ── 示例：手动选择 5 特征的 checkpoint ──
-    # model, sX, sY, feats = load_by_feature_count('models/SVR', 5)
-
-    # ── 示例：并排对比 7 特征 vs 5 特征 ──
-    # compare_checkpoints('models/SVR', 7, 5)
-
-    # ── 示例：用选定模型预测新数据 ──
-    # predict_with_checkpoint('models/SVR', 'new_data.csv', n_features=5)
-    pass
+    # model, scaler_X, scaler_y, features = load_final_model("models/SVR")
+    # model, scaler_X, scaler_y, features = load_by_feature_count("models/SVR", 5)
+    # compare_checkpoints("models/SVR", 7, 5)
+    # predict_with_checkpoint("models/SVR", "new_data.csv", n_features=5)

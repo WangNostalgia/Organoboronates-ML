@@ -19,6 +19,7 @@ dependencies = [
     "shap>=0.47.2",
     "xgboost>=3.0.2",
     "catboost>=1.2",
+    "gplearn>=0.4.2",
 ]
 # Optional: pip install sissopp for SISSO symbolic regression
 # Optional: pip install lightgbm (already in requirements.txt)

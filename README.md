@@ -1,357 +1,188 @@
-# Machine Learning Tool for Organoboronate Reactivity Prediction
+# Machine Learning Tool for Organoboronate Activation-Energy Prediction
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)]() [![License](https://img.shields.io/badge/License-MIT-green)]() [![DOI](https://img.shields.io/badge/DOI-10.1038%2Fs41467--025--60674--9-blue)](https://doi.org/10.1038/s41467-025-60674-9)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue)]() [![License](https://img.shields.io/badge/License-MIT-green)]() [![DOI](https://img.shields.io/badge/DOI-10.1038%2Fs41467--025--60674--9-blue)](https://doi.org/10.1038/s41467-025-60674-9)
 
 [English](README.md) | [中文](README_CN.md)
 
-This project is a supplementary material for the machine learning component of our research paper "[**Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond**](https://doi.org/10.1038/s41467-025-60674-9)". It contains machine learning models and analysis tools for predicting the activation energies of organoboronate reactions.
+This repository contains the supplementary machine-learning workflow for the Nature Communications paper ["Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond"](https://doi.org/10.1038/s41467-025-60674-9). The code predicts reaction activation energies in kcal/mol and ships with training, checkpointing, external validation, applicability-domain analysis, and standalone y-randomization utilities.
 
-## Table of Contents
+More detailed references:
 
-1. [System Requirements](#system-requirements)
-2. [Installation Guide](#installation-guide)
-3. [Workflow Overview](#workflow)
-4. [Detailed Usage Guide](#detailed-usage-guide)
-   - [Data Preparation](#data-preparation)
-   - [Model Training and Feature Selection](#model-training-and-feature-selection)
-   - [Further Feature Filtering](#further-feature-filtering)
-   - [Model Evaluation and Visualization](#model-evaluation-and-visualization)
-   - [External Validation and Prediction](#external-validation-and-prediction)
-5. [Expected Runtime](#expected-runtime)
-6. [Reproduction Instructions](#reproduction-instructions)
-7. [License](#license)
+- Conceptual workflow: [Pipeline.md](Pipeline.md)
+- Step-by-step execution guide: [user_manual.md](user_manual.md)
+- Repository-specific agent guidance: [AGENTS.md](AGENTS.md)
 
-## System Requirements
+## Requirements
 
-### Software Dependencies and Operating Systems
+- Python >= 3.12
+- Recommended installer: `uv sync`
+- Alternative installer: `pip install -r requirements.txt`
 
-Main dependencies:
+The supported full installation includes:
 
-- Python >= 3.9
-- pandas >= 2.0
-- numpy >= 1.20
-- scikit-learn >= 1.0
-- matplotlib >= 3.5
-- seaborn >= 0.12
-- xgboost >= 1.5
-- lightgbm >= 3.3
-- optuna >= 3.0
-- shap >= 0.40
-- joblib >= 1.1
+- scikit-learn
+- optuna
+- shap
+- xgboost
+- lightgbm
+- catboost
+- gplearn
+- matplotlib / seaborn / pandas / numpy / joblib
 
-For a complete list of dependencies, see the [requirements.txt](requirements.txt) file.
-
-### Tested Operating Systems
-
-- Linux: Arch Linux
-- Windows: Windows 10, Windows 11
-
-### Hardware Requirements
-
-- CPU: Any modern multi-core processor (4+ cores recommended)
-- RAM: Minimum 4GB, 8GB+ recommended
-- Storage: At least 500MB free space
-- GPU: Not required, but if a CUDA-compatible GPU is installed, some models (like XGBoost) may be accelerated
-
-## Installation Guide
-
-### Installation Steps
-
-1. Clone or download this repository:
+## Quick start
 
 ```bash
-git clone https://github.com/Daojing-Li/Stable-Organoboronates-ML-Supp
-cd Stable-Organoboronates-ML-Supp
-```
-
-2. Set up the environment and install dependencies:
-
-#### Option 1: Using uv (Recommended - Much Faster)
-
-uv is a high-performance Python package manager written in Rust that can significantly speed up dependency installation.
-
-**Typical install time: ~30 seconds** on a standard desktop computer
-
-```bash
-# Install uv if you don't have it
-# On macOS and Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# On Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Single command to create environment and install all dependencies
 uv sync
+python main.py --n_trials 100 --min_features 5
 ```
 
-This single command automatically:
-- Creates a virtual environment at `.venv`
-- Installs all dependencies from requirements.txt
-- Optimizes installation with parallel downloads and caching
+Useful variants:
 
-To activate the virtual environment:
-```bash
-# On Linux/macOS
-source .venv/bin/activate
+- Quick smoke run: `python main.py --n_trials 20 --min_features 5`
+- Show CLI help: `python main.py --help`
+- Evaluation notebook: `jupyter notebook example/example_pic.ipynb`
+- Prediction notebook: `jupyter notebook example/prediction_round2.ipynb`
+- Standalone y-randomization: `python example/standalone_y_randomization.py`
 
-# On Windows
-.venv\Scripts\activate
-```
+## Active default model registry
 
-#### Option 2: Using standard tools
+`main.py` currently enables these models by default:
 
-**Typical install time: 3-5 minutes** on a standard desktop computer
+- LinearRegression
+- Ridge
+- Lasso
+- SVR
+- DecisionTree
+- RandomForest
+- GradientBoosting
+- XGBoost
+- KRR
+- MLP
+- AdaBoost
+- ElasticNet
+- KNR
+- LightGBM
+- CatBoost
+- GPlearn
 
-```bash
-# Create virtual environment
-python -m venv .venv
+`GaussianProcessRegressor` is still present in the file but commented out, so it is not part of the default run.
 
-# Activate the environment
-# On Linux/macOS
-source .venv/bin/activate
-# On Windows
-.venv\Scripts\activate
+## Current training and evaluation protocol
 
-# Install dependencies
-pip install -r requirements.txt
-```
+### 1. Fixed boundary between development and final test
 
-## Workflow
+`iterative_optimization()` creates one 80/20 split at the entry point with `random_state=40`, and every active model family shares that exact split.
 
-This project provides a complete workflow for building and evaluating machine learning models for organoboronate reactivity prediction:
+- Development set (80%): hyperparameter tuning, SHAP-driven feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability analysis
+- Final test set (20%): scored exactly once after feature count and hyperparameters are locked
 
-### 1. Data Preparation
+The test set is not used for model selection.
 
-Input data should be in CSV format, containing physicochemical properties and target activation energy values. See the `example/B_dataset.csv` file for an example of the data format.
+### 2. Hyperparameter tuning
 
-### 2. Model Selection and Feature Optimization
+`src/train_and_evaluate.py` tunes on development data only.
 
-Use the main script `main.py` for model training, hyperparameter optimization, and iterative feature selection:
+- Optuna uses an internal 5-fold MAE objective
+- Studies are in-memory for each run
+- Ridge and Lasso use explicit fold-local alpha loops with fold-local scaling
+- Every fold scales `X` and `y` on training data only, then inverse-transforms predictions before computing MAE
 
-```bash
-python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
-```
+### 3. Feature elimination and feature-count choice
 
-This step will:
-- Train multiple machine learning models (SVR, Random Forest, K-Neighbors Regressor, etc.)
-- Perform hyperparameter optimization via Optuna with Leave-One-Out Cross-Validation (LOO-CV)
-- Evaluate models with a **dual cross-validation system**: 5×5 RepeatedKFold as primary metric (lower variance, better stability assessment) and LOOCV as auxiliary reference
-- Conduct iterative feature selection using a **hybrid strategy**: original SHAP + correlation method when features ≥ 10, switching to SHAP-RFECV for refined selection when features < 10
-- Execute **y-randomization test** on the final best model to verify that predictions are based on genuine structure-activity relationships rather than chance correlations
-- Save the best models and all performance metrics (including RepeatedKFold and LOOCV results)
+For non-GPlearn models, the feature-removal loop is SHAP-driven:
 
-### 3. Further Feature Filtering
+- coarse single-fit SHAP when the feature count is still high
+- 5-fold consensus SHAP-RFECV when the feature count is small enough
+- remove the weaker member of any highly correlated pair first, otherwise remove the globally least important feature
 
-The built-in **SHAP-RFECV** pipeline (Stages 4-5) already performs automatic feature selection with multi-fold CV consensus SHAP and 1-SE rule optimization — no additional scripts are needed.
+`--min_features` is the stopping floor and defaults to `5`.
 
-### 4. Model Evaluation and Visualization
+`--force_n_features` does not skip path evaluation. It evaluates the SHAP-RFECV path down to `--min_features`, then selects the exact requested feature count from that evaluated path.
 
-Use `example/example_pic.ipynb` to generate comprehensive model evaluation and visualization results:
+### 4. Metric roles
 
-- Scatter plots comparing actual vs. predicted values
-- Leave-one-out cross-validation (LOO)
-- Model stability assessment across 100 random splits
-- Feature importance analysis
+Primary final metrics:
 
-### 5. External Validation and New Data Prediction
+- `test_mae`
+- `test_r2`
 
-Use `example/prediction_round2.ipynb` to predict and externally validate on new data:
+Secondary development-only metrics:
 
-- Load the trained best model
-- Preprocess new data
-- Generate prediction results
-- Evaluate prediction performance (if actual values are available for comparison)
+- `internal_cv.rkf_mae_mean/std`
+- `internal_cv.rkf_r2_mean/std`
+- `stability.mae_mean/std`
+- `loo.mae`
+- `loo.r2`
 
-## Detailed Usage Guide
+Legacy aliases are still written for compatibility, but they are not the primary model-selection outputs anymore.
 
-### Data Preparation
+### 5. y-randomization
 
-#### Data Format Requirements
+The automatic full-pipeline y-randomization block remains disabled because of runtime cost. The supported path is the standalone script:
 
-Input data should be in CSV format, containing the following columns:
+- `example/standalone_y_randomization.py`
 
-1. Compound identifiers (e.g., `sub_H`, `sub_B`)
-2. Various physicochemical properties, including but not limited to:
-   - `pka_H`: pKa value
-   - `dipole_H`: Dipole moment
-   - `homo_H`: Highest Occupied Molecular Orbital energy
-   - `lumo_H`: Lowest Unoccupied Molecular Orbital energy
-   - `delta_G_B`: Gibbs free energy of boron reagent
-   - `NICS1`: Nucleus Independent Chemical Shift
-   - Other physicochemical properties
-3. Target variable `activation_energy` (in kcal/mol)
+That script:
 
-### Model Training and Feature Selection
+- loads already selected checkpoints
+- reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
+- reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
 
-#### Using the main.py Script
+### 6. Checkpoint loading and external validation
 
-`main.py` is the main entry point of the project, used for training multiple regression models, optimizing hyperparameters, and performing iterative feature selection:
+Checkpoint selection follows `src.external_validation.load_model()`:
 
-```bash
-python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
-```
+- search both final and iteration checkpoints
+- exact feature count required by default
+- exact final checkpoints preferred over exact iteration checkpoints
+- newest filename timestamp wins inside the chosen checkpoint class
+- nearest-match fallback is allowed only with `allow_closest=True` / `--allow-closest`
 
-#### Parameter Explanation
+`example/load_checkpoint_guide.py` shows how to inspect these checkpoints safely.
 
-- `--n_trials`: Number of trials for Optuna optimization (default 100)
-  - Higher values may lead to better model performance but require longer training time
-  - Recommended range: 50-200
+### 7. Applicability domain
 
-- `--mae_threshold`: MAE threshold for filtering good models (default 2.0, unit: kcal/mol)
-  - Models with MAE below this threshold are considered "good" — their evaluation plots are displayed
-  - Recommended range: 1.0-5.0, depending on your data and expected accuracy
+Applicability-domain analysis uses:
 
-- `--min_features`: Minimum number of features to retain (default 5)
-  - The iterative feature removal stops when this many features remain
-  - Recommended range: 5-10
+- training-set 5-fold OOF residuals
+- MAD-based residual scaling with finite fallbacks
+- descriptor-space leverage
 
-- `--n_jobs`: Number of CPU cores to use (default -1, meaning all cores)
-  - Can speed up the training process, especially with tree-based models
-  - In resource-constrained environments, you can set this to a smaller value
+If external ground truth is absent, the Williams plot switches to a leverage-only prediction view instead of inventing residual thresholds from missing labels.
 
-- `--keep_versions`: Number of versions to keep for each model (default 2)
-  - Controls how many best model versions to save for each model type
-  - Higher values will use more disk space
+## CLI arguments for `main.py`
 
-#### Training Process
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--n_trials` | `100` | Optuna trials per model on the development set |
+| `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
+| `--keep_versions` | `2` | Number of recent final-model runs/checkpoint families to retain |
+| `--min_features` | `5` | Minimum feature floor for SHAP-RFECV path evaluation |
+| `--force_n_features` | `None` | Select an exact evaluated feature count instead of auto-selecting from the path |
 
-1. The script will automatically start training multiple models, including SVR, Random Forest, K-Neighbors Regressor, etc.
-2. For each model, Optuna performs Bayesian hyperparameter optimization with LOOCV on the training set. **Ridge** uses RidgeCV for automatic alpha selection (skipping Optuna entirely); **Lasso** uses LassoCV for alpha selection while Optuna tunes the tolerance parameter.
-3. **SVR** uses a narrowed epsilon search range (0.001–0.5) for better fitting precision on activation energy prediction.
-4. The script iteratively removes low-importance or high-correlation features and retrains until reaching `min_features` or no more features qualify for removal. When the number of features drops below 10, the feature selection method switches from fixed-threshold SHAP+correlation to **SHAP-RFECV** for data-driven feature elimination.
-5. After the best model is obtained, a **y-randomization test** (100 permutations, 5×5 RepeatedKFold evaluation) automatically verifies the model's predictive validity.
-6. Training process logs will be output to the console and saved in the `models` directory.
+## Output layout
 
-#### Evaluation System
-
-The project uses a **dual cross-validation** framework:
-
-| Layer | Method | Role | Output |
-|---|---|---|---|
-| **Primary** | 5×5 RepeatedKFold | Model comparison, feature selection, hyperparameter tuning | MAE ± std, R² ± std |
-| **Auxiliary** | LOOCV | Robustness reference, literature comparison | R², MAE |
-
-All model ranking and feature selection decisions are based on **5×5 RepeatedKFold** results. LOOCV values are provided as supplementary reference only.
-
-#### Training Results
-
-After training is complete, the best models and related results will be saved in the `models` directory, with a subdirectory for each model type:
-
-```
+```text
 models/
-├── SVR/
-│   ├── SVR_final_20260412133724.joblib       # Saved final model (includes scalers, features, hyperparameters, all metrics)
-│   ├── SVR_final_20260412133724_metrics.txt   # Final model performance metrics
-│   ├── SVR_iteration_1_20260412133241.joblib  # Per-iteration checkpoints
-│   ├── final_scatter_20260412133724.png       # Actual vs predicted scatter plot
-│   ├── performance_history_20260412133724.csv # Iteration-by-iteration metrics
-│   └── ...
-├── RandomForest/
-│   └── ...
-└── KNR/
-    └── ...
+├── <ModelName>/
+│   ├── <ModelName>_iteration_<N>_<timestamp>.joblib
+│   ├── <ModelName>_iteration_<N>_<timestamp>_metrics.txt
+│   ├── <ModelName>_final_<timestamp>.joblib
+│   ├── <ModelName>_final_<timestamp>_metrics.txt
+│   ├── final_scatter_<timestamp>.png
+│   ├── final_scatter_<timestamp>_outliers.csv
+│   ├── performance_history_<timestamp>.csv
+│   └── performance_history_<timestamp>.png
+└── optimization_<timestamp>.log
 ```
 
-### Further Feature Filtering
+Iteration checkpoints store development-only metrics. Final checkpoints add the one-time final test result, split metadata, scalers, complete merged hyperparameters, and the chosen feature order.
 
-If the number of features after initial filtering is still high, you can use the `example/model_feature_filter.py` script to further reduce the number of features:
+## Notes on reproducibility
 
-#### Using model_feature_filter.py
-
-1. Open the script and modify the following parameters:
-   - Data file path
-   - Target maximum number of features (`max_features` parameter)
-   - Model types (uncomment or comment the corresponding models)
-
-2. Run the script:
-
-```bash
-python example/model_feature_filter.py
-```
-
-3. The script will output the optimal feature set after filtering and the corresponding model performance.
-
-#### Feature Filtering Principle
-
-This script uses the Recursive Feature Elimination with Cross-Validation (RFECV) method, filtering features through the following steps:
-
-1. Initialize the model and set hyperparameters
-2. Train the initial model and evaluate performance
-3. Recursively remove the least important features and re-evaluate performance
-4. Find the smallest feature subset that provides the best performance
-
-### Model Evaluation and Visualization
-
-Use the `example/example_pic.ipynb` Jupyter notebook for detailed model evaluation and visualization:
-
-The notebook contains the following main functions:
-- Load the trained best model
-- Generate scatter plots comparing actual vs. predicted values
-- Perform Leave-One-Out (LOO) cross-validation to assess model robustness
-- Evaluate model stability across 100 random data splits
-- Analyze feature importance
-
-### External Validation and Prediction
-
-Use `example/prediction_round2.ipynb` for external validation and prediction on new data:
-
-The notebook contains the following main functions:
-- Load the trained best model
-- Load new validation datasets
-- Preprocess data to fit the model input
-- Generate prediction results
-- Evaluate prediction performance (if actual values are available for comparison)
-- Visualize prediction results
-
-#### Predicting New Data
-
-To predict completely new data, you need to:
-
-1. Prepare a new data file containing the same features
-2. Modify the data loading section in the notebook to point to your new data
-3. Run the prediction part of the notebook
-4. Analyze and export the prediction results
-
-## Expected Runtime
-
-The runtime for the different steps of the workflow can vary significantly depending on your hardware. Below are typical runtime estimates on a standard desktop computer:
-
-1. **Data Preparation**: Negligible (seconds)
-
-2. **Model Training and Iterative Feature Selection** (Step 2): 
-   - **Several days** on a personal computer for complete model training with the recommended parameters (3 models × 100 trials each, with iterative feature removal)
-   - For testing purposes, you can reduce `n_trials` to 20, which will complete in a few hours
-
-3. **Further Feature Filtering** (Step 3):
-   - Runtime depends heavily on the `max_features` parameter and the total number of features
-   - Exhaustive search over many feature combinations can take **days** on a personal computer
-   - For testing purposes, setting `max_features=3-5` will significantly reduce runtime
-
-4. **Model Evaluation and Visualization**: Minutes to hours depending on the complexity and number of models
-
-5. **External Validation and Prediction**: Minutes
-
-## Reproduction Instructions
-
-To reproduce the exact results from our paper, follow these steps:
-
-1. Complete the installation as described in the [Installation Guide](#installation-guide)
-
-2. Run the initial model training with the recommended parameters:
-   ```bash
-   python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
-   ```
-
-3. The built-in SHAP-RFECV pipeline automatically determines the optimal feature subset — no additional filtering scripts are needed.
-
-4. Generate evaluation visualizations using the notebooks in the `example` directory
-
-5. For external validation, use the `example/prediction_round2.ipynb` notebook
-
-These steps will reproduce the results presented in our paper. For quick testing or exploration, you can reduce computational time by:
-- Using fewer trials in Step 2 (e.g., `--n_trials 20`)
-- Setting a smaller `max_features` value (e.g., 3-5) in Step 3
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details. 
+- Fixed development/final split seed: `40`
+- Fixed evaluation seeds inside development utilities: `42`
+- Target values are not clipped
+- Matplotlib uses the `Agg` backend in the optimization workflow
+- `src/fixed_params.py` is the single source of truth for fixed model parameters
+- `src/evaluation.py` is the single source of truth for 5×5 RepeatedKFold evaluation

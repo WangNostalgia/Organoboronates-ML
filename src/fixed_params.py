@@ -64,7 +64,7 @@ def get_fixed_params(model_class, n_jobs=-1):
     # The dict is small (<20 entries) so the recreation cost is negligible.
     FIXED_PARAMS_MAP = {
         LinearRegression: {},
-        Ridge: {},  # RidgeCV handles alpha internally
+        Ridge: {},  # alpha is selected by explicit fold-local search elsewhere
         Lasso: {"max_iter": 10000, "selection": "cyclic", "random_state": 42},
         ElasticNet: {
             "max_iter": 50000, "selection": "cyclic", "random_state": 42,

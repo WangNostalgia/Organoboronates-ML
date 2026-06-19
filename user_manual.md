@@ -1,290 +1,289 @@
-# User Manual: Following the ML Pipeline
+# User Manual
 
-This manual provides step-by-step instructions for executing the machine learning pipeline described in [Pipeline.md](Pipeline.md) and [Pipeline.txt](Pipeline.txt). The pipeline predicts **activation energy (kcal/mol)** of organoboronate reactions.
+This manual explains how to run the current repository as it exists in code today. For the conceptual six-stage overview, read [Pipeline.md](Pipeline.md) first.
 
-For a conceptual overview of the workflow, read [Pipeline.md](Pipeline.md) first.
+## 1. Environment setup
 
----
+Required runtime:
 
-## Pipeline-to-Code Mapping
+- Python >= 3.12
 
-Below, each pipeline stage is mapped to the exact code, commands, and steps required.
-
----
-
-### Stage 1: Data Preparation (Data Preprocessing & Split)
-
-**What the pipeline says:**
-- Clean data: drop all-NaN columns, filter numeric features
-- Split data into Training Set / Test Set (80/20)
-
-**How to execute:**
-
-Data preparation happens in `main.py` (lines 76-81):
-
-```python
-data = pd.read_csv('example/B_dataset.csv')
-data = data.dropna(axis=1, how='all')   # Drop columns that are entirely NaN
-features = data.select_dtypes(include=[np.number]).columns  # Select numeric columns
-X = data[features].drop('activation_energy', axis=1)  # Feature matrix
-y = data['activation_energy']                           # Target variable
-```
-
-The 80/20 split with `random_state=42` is performed inside `src/train_and_evaluate.py`:
-
-```python
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
-```
-
-**Input CSV must contain:**
-- Non-numeric identifier columns (`sub_H`, `sub_B`) — automatically excluded
-- Numeric physicochemical property columns (e.g., `pka_H`, `dipole_H`, `homo_H`, `lumo_H`, `delta_G_B`, `NICS1`, etc.)
-- The target column: **`activation_energy`** (kcal/mol)
-
-**To start:** place your CSV at `example/B_dataset.csv` (or edit the path in `main.py` line 76).
-
----
-
-### Stage 2: Model Training & Hyperparameter Optimization (LOOCV + Bayesian Opt.)
-
-**What the pipeline says:**
-- Train SVR, RandomForest, and KNR models
-- Use Leave-One-Out Cross Validation (LOOCV) inside Optuna's objective function
-- Use Bayesian Optimization (TPESampler) to tune hyperparameters
-- Train initial model with best hyperparameters
-
-**How to execute:**
-
-Fully implemented in `src/train_and_evaluate.py`. The `objective()` function performs LOOCV on the training split for each Optuna trial. Optuna uses `TPESampler` with `n_startup_trials=5`, all random seeds fixed to 42.
-
-**To run this for all active models:**
-```bash
-python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
-```
-
-**To run for a single model in a script/notebook:**
-```python
-from src.train_and_evaluate import train_and_evaluate
-from sklearn.svm import SVR
-import pandas as pd
-
-data = pd.read_csv('example/B_dataset.csv').dropna(axis=1, how='all')
-features = data.select_dtypes(include=['number']).columns
-X = data[features].drop('activation_energy', axis=1)
-y = data['activation_energy']
-
-mae_loo, mae_mean, best_params = train_and_evaluate(
-    SVR, X, y, random_state=42, n_trials=100, n_jobs=-1
-)
-# Prints: best hyperparameters, train/test R², RMSE, MAE
-# Automatically evaluates on 100 random splits
-```
-
-Optuna studies are persisted as `optuna_optimization_{ModelClass}.db` SQLite files for resuming interrupted runs.
-
----
-
-### Stage 3: Model Evaluation 1 (Test Set Assessment + 100-split stability)
-
-**What the pipeline says:**
-- Evaluate initial model on test set; check for overfitting
-- Run 100 random train/test splits to assess stability; compute average MAE
-
-**How to execute:**
-
-Done automatically inside `train_and_evaluate()` (lines 277-333). After Optuna optimization:
-
-```
-random_state = 42
-Best hyperparameters: {'C': 63.91, 'epsilon': 0.017, 'gamma': 5.27}
-Train R²: 0.9234         ← compare these two
-Test R²:  0.8745         ← to check overfitting
-Test RMSE: 3.25 kcal/mol
-Test MAE:  2.13 kcal/mol
-Average MAE on 100 times random test sets: 2.13
-Best random state: 17 with best MAE: 1.45
-```
-
-If Train R² significantly exceeds Test R², overfitting is present.
-
----
-
-### Stage 4: Iterative Feature Selection (SHAP + Correlation + Filtering)
-
-**What the pipeline says:**
-- SHAP analysis: per-feature importance percentages
-- Correlation analysis: identify redundant pairs (|r| > 0.8)
-- Feature selection: remove least important in high-correlation pairs, then low-importance features (<20%)
-- Iterative filtering: retrain after removal, repeat until stopping condition
-
-**How to execute:**
-
-This is the core loop in `src/iterative_optimization.py`. Each iteration:
-1. Re-trains the model with current features (calls Stage 2)
-2. Runs `feature_importance_analysis()` — automatically selects the right SHAP explainer
-3. Runs `feature_correlation_analysis()` — Pearson correlation matrix
-4. Runs `feature_selection()` — two-phase selection (high-correlation → low-importance)
-5. Removes selected feature(s) and loops back
+Recommended install:
 
 ```bash
-python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5
+uv sync
 ```
 
-Console/log output per iteration:
-```
-=== Feature Importance Ranking (Iteration 1) ===
-  [1] delta_G_B:         35.21%
-  [2] lumo_B:            28.14%
-  [3] NICS1:             15.33%
-  ...
-Removing feature: dipole_H
-Feature importance: 4.21%
-Correlation with other features:
-  dipole_H - electronegativity_H: 0.85
-```
-
-Feature importance < 20% and correlation > 0.8 thresholds are hardcoded in `src/feature_selection.py`.
-
-**Stopping conditions:**
-- `len(features) <= min_features` (default: 5)
-- No high-correlation pairs AND no features with importance < 20%
-
-**Exhaustive combinatorial search** (alternative, slower):
-```bash
-# Edit example/model_feature_filter.py first:
-#   - set data path, max_features, uncomment desired models
-python example/model_feature_filter.py
-```
-
----
-
-### Stage 5: Final Build & Rigorous Testing
-
-**What the pipeline says:**
-- Build final model with selected features only
-- LOO-CV validation on final feature set
-- Performance history tracking
-- Generate scatter plots and outlier analysis
-
-**How to execute:**
-
-Done automatically at the end of the iterative loop in `iterative_optimization.py`:
-
-1. LOO-CV on the final feature set → R²_LOO
-2. Final model trained with all remaining features
-3. Performance history saved as CSV + PNG
-4. Final scatter plot (actual vs. predicted, with outlier detection at deviation ≥ 5.0 kcal/mol)
-5. Model saved as `models/<ModelName>/<ModelName>_final_<timestamp>.joblib`
-
-**Final model `.joblib` contents:**
-```python
-{
-    'model': best_model,           # Trained sklearn model
-    'scaler_X': MinMaxScaler,      # Feature scaler
-    'scaler_y': MinMaxScaler,      # Target scaler (0, 100)
-    'features': [...],             # Final feature names
-    'hyperparameters': {...},      # Best hyperparameters
-    'metrics': {
-        'mae_mean': ...,           # Mean MAE from Optuna
-        'r2_test': ...,            # Test set R²
-        'mae_test': ...,           # Test set MAE
-        'r2_loo': ...              # LOO cross-validation R²
-    },
-    'removed_features': [...]      # Features removed in order
-}
-```
-
-**To load and use a saved model:**
-```python
-import joblib
-model_info = joblib.load('models/SVR/SVR_final_20260412_133724.joblib')
-model = model_info['model']
-features = model_info['features']
-# Predict: model.predict(scaler_X.transform(X[features]))
-```
-
-**To run standalone 100-split evaluation on an existing model**, use `example/example_pic.ipynb`:
-```python
-model_info = joblib.load('models/SVR/SVR_final_20260412_133724.joblib')
-# Use the plot_r2_on_100_random_samples function from the notebook
-```
-
----
-
-### Stage 6: External Validation & Ensemble Prediction
-
-**What the pipeline says:**
-- Test on completely independent, external data
-- Generate full combinatorial sub_H × sub_B validation space
-- Ensemble prediction across 100 random-split models
-- Weighted prediction (by inverse MSE) for final output
-
-**How to execute:**
-
-This stage is **notebook-based** (not in the `main.py` CLI).
-
-#### Step 6a: Generate validation dataset
-
-```python
-from src.validation_process import validation_data_produce
-import pandas as pd
-
-data = pd.read_csv('your_data.csv')
-H_feature_cols = ['pka_H', 'dipole_H', 'homo_H', 'lumo_H', ...]
-B_feature_cols = ['pka_B', 'delta_G_B', 'delta_G_B_TS', 'dipole_B', ...]
-
-validation_data = validation_data_produce(data, H_feature_cols, B_feature_cols)
-validation_data.to_csv('validation_data.csv', index=False)
-```
-
-#### Step 6b: Run prediction notebook
+Alternative install:
 
 ```bash
+pip install -r requirements.txt
+```
+
+The supported full installation includes the default model stack: XGBoost, LightGBM, CatBoost, and GPlearn in addition to the scikit-learn models.
+
+## 2. Input data format
+
+The main training entry point expects a CSV like [example/B_dataset.csv](example/B_dataset.csv).
+
+Required structure:
+
+- numeric descriptor columns
+- one target column named `activation_energy`
+- optional identifier columns such as `sub_H` and `sub_B`
+
+`main.py` automatically:
+
+- reads `example/B_dataset.csv`
+- drops all-NaN columns
+- keeps numeric columns
+- removes `activation_energy` from `X`
+- uses `activation_energy` as `y`
+
+## 3. Main training commands
+
+Full run:
+
+```bash
+python main.py --n_trials 100 --min_features 5
+```
+
+Quick run:
+
+```bash
+python main.py --n_trials 20 --min_features 5
+```
+
+Show current CLI:
+
+```bash
+python main.py --help
+```
+
+Notebook entry points:
+
+```bash
+jupyter notebook example/example_pic.ipynb
 jupyter notebook example/prediction_round2.ipynb
 ```
 
-The notebook provides three prediction strategies:
+Standalone y-randomization:
 
-| Cell | Strategy | Description |
-|---|---|---|
-| 1-2 | **Weighted average** | 100 models, weighted by `1/MSE`. Output: `final_with_y_pred_weighted_mean.csv` |
-| 4 | **Simple average** | 100 models, arithmetic mean. Output: `final_with_y_pred_mean.csv` |
-| 5 | **Single model** | Uses a single `random_state=10` split. Output: `target_with_y_pred_mean.csv` |
+```bash
+python example/standalone_y_randomization.py
+```
 
-**Before running the notebook:**
-1. Place your training data CSV in the working directory
-2. Generate `validation_data.csv` using `validation_process.py`
-3. Edit the model hyperparameters in each cell to match your best model
-4. Edit the feature column list to match your selected features
-5. Edit the target column name (the notebook defaults to `yield`)
+## 4. CLI arguments
 
----
+| Argument | Default | What it controls |
+|---|---:|---|
+| `--n_trials` | `100` | Optuna trials per model on the development set |
+| `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
+| `--keep_versions` | `2` | Number of recent checkpoint families to retain per model |
+| `--min_features` | `5` | Stopping floor for SHAP-RFECV path evaluation |
+| `--force_n_features` | `None` | Select an exact evaluated feature count after the path has been evaluated |
 
-## Complete Execution Checklist
+`--force_n_features` is not a shortcut around feature elimination. It still evaluates the development-set SHAP-RFECV path and then selects the requested exact point from that path.
 
-| Stage | Action | Output |
-|---|---|---|
-| **1. Data Prep** | Place `example/B_dataset.csv` in the repo | — |
-| **2. Initial Training** | `python main.py --n_trials 100 --mae_threshold 2.0 --min_features 5` | `models/*/`, Optuna DBs, logs |
-| **3. Evaluation 1** | Review console output: compare Train R² vs Test R², check 100-split MAE | Overfitting assessment |
-| **4. Feature Selection** | Review `models/optimization_*.log` for per-iteration feature ranking | Feature importance ranking, removed features list |
-| **4. Exhaustive Filtering** | Edit & run `example/model_feature_filter.py` (optional) | Optimal feature subset |
-| **5. Final Build** | `models/<Model>/<Model>_final_*.joblib` is the final model | `.joblib` file with all artifacts |
-| **5. Visualizations** | Open `models/<Model>/final_scatter_*.png` and `performance_history_*.png` | Scatter plot, performance traces |
-| **6. Validation Space** | Run `validation_process.py` | `validation_data.csv` |
-| **6. External Valid.** | Run `example/prediction_round2.ipynb` | Prediction CSV, evaluation scatter plot |
+## 5. What `main.py` actually does
 
----
+### Stage A: fixed split at the top level
 
-## Runtime Estimates
+`src.iterative_optimization.iterative_optimization()` creates one 80/20 split with `random_state=40`.
 
-| Stage | Typical Runtime |
-|---|---|
-| Data preparation | Seconds |
-| `main.py --n_trials 100` (3 models) | Several days on a personal computer |
-| `main.py --n_trials 20` (quick test) | A few hours |
-| `model_feature_filter.py` with many combinations | Days |
-| Notebook evaluation/visualization | Minutes to hours |
-| External validation prediction | Minutes |
+- Development set (80%): all model selection activity
+- Final test set (20%): held out until the very end
+
+All models share that same split, so their final test metrics are paired on the same samples.
+
+### Stage B: model registry
+
+The active default registry in `main.py` is:
+
+- LinearRegression
+- Ridge
+- Lasso
+- SVR
+- DecisionTree
+- RandomForest
+- GradientBoosting
+- XGBoost
+- KRR
+- MLP
+- AdaBoost
+- ElasticNet
+- KNR
+- LightGBM
+- CatBoost
+- GPlearn
+
+`GaussianProcessRegressor` is present in the source but commented out.
+
+### Stage C: development-only hyperparameter selection
+
+`src/train_and_evaluate.py` handles parameter selection on development data only.
+
+Current behavior:
+
+- Optuna objective: internal 5-fold MAE on the development subset
+- Optuna storage: in-memory study per run
+- Ridge: explicit inner-fold alpha loop
+- Lasso: explicit inner-fold alpha loop plus Optuna tuning for `tol`
+- Every fold fits feature and target scalers on training data only
+- MAE is computed after inverse-transform back to kcal/mol
+
+### Stage D: SHAP-driven feature elimination
+
+For non-GPlearn models, each iteration:
+
+1. tunes on the current development feature subset
+2. records development-only metrics
+3. saves an iteration checkpoint
+4. removes one feature using SHAP-RFECV logic
+
+Removal strategy:
+
+- if a high-correlation pair is present, remove the less important member
+- otherwise remove the globally weakest feature
+
+Mode switching:
+
+- many features: coarse single-fit SHAP
+- few features: 5-fold consensus SHAP-RFECV
+
+The loop stops when either:
+
+- remaining features reach `min_features`
+- no more features qualify for removal
+
+### Stage E: final model build and one-time final test
+
+After path selection is finished:
+
+1. the selected feature set is locked
+2. the chosen estimator is refit on all development rows for those features
+3. the untouched final test split is scored exactly once
+
+Primary final metrics:
+
+- `test_mae`
+- `test_r2`
+
+Secondary development-only metrics:
+
+- `internal_cv.rkf_mae_mean/std`
+- `internal_cv.rkf_r2_mean/std`
+- `stability.mae_mean/std`
+- `loo.mae`
+- `loo.r2`
+
+The final test set is not used for:
+
+- tuning
+- SHAP analysis
+- feature elimination
+- feature-count selection
+- LOOCV
+- 100-split stability analysis
+
+### Stage F: saved artifacts
+
+Per-model artifacts:
+
+```text
+models/<ModelName>/
+├── <ModelName>_iteration_<N>_<timestamp>.joblib
+├── <ModelName>_iteration_<N>_<timestamp>_metrics.txt
+├── <ModelName>_final_<timestamp>.joblib
+├── <ModelName>_final_<timestamp>_metrics.txt
+├── final_scatter_<timestamp>.png
+├── final_scatter_<timestamp>_outliers.csv
+├── performance_history_<timestamp>.csv
+└── performance_history_<timestamp>.png
+```
+
+The final checkpoint includes:
+
+- fitted estimator
+- fitted `scaler_X`
+- fitted `scaler_y`
+- final feature order
+- complete merged hyperparameters
+- primary and secondary metrics
+- split metadata
+- removed-feature history
+
+## 6. Checkpoint loading
+
+Use [example/load_checkpoint_guide.py](example/load_checkpoint_guide.py) for interactive examples, or call `src.external_validation.load_model()` directly.
+
+Selection rules:
+
+- search both final and iteration checkpoints
+- exact feature count required by default
+- exact final preferred over exact iteration
+- newest filename timestamp wins inside the preferred class
+- closest-match fallback only if `allow_closest=True`
+
+This means “load 5 features” is deterministic and will not silently pick a nearby checkpoint unless you explicitly allow that.
+
+## 7. External validation
+
+The external-validation CLI lives in `src/external_validation.py`.
+
+Examples:
+
+```bash
+python src/external_validation.py --list-models
+python src/external_validation.py --model SVR --data external.csv
+python src/external_validation.py --model SVR --n_features 5 --data external.csv
+python src/external_validation.py --model SVR --n_features 5 --data external.csv --allow-closest
+python src/external_validation.py --model SVR --data new_compounds.csv --predict-only
+```
+
+Notes:
+
+- default behavior is exact feature-count loading
+- `--allow-closest` opts into nearest-match fallback
+- ensemble validation aligns members on the common original row index, not by positional truncation
+
+## 8. Applicability domain
+
+The applicability-domain CLI lives in `src/applicability_domain.py`.
+
+Example:
+
+```bash
+python src/applicability_domain.py --model SVR --n_features 5 --training example/B_dataset.csv --external external.csv
+```
+
+Current behavior:
+
+- residual calibration comes from training-set 5-fold OOF residuals
+- residual scale uses MAD with finite fallbacks
+- no external `sqrt(1-h)` correction is applied
+- prediction-only mode becomes leverage-only if no external ground truth is present
+
+## 9. Standalone y-randomization
+
+The repository currently supports y-randomization as a standalone validation step, not as an automatic step inside `main.py`.
+
+`example/standalone_y_randomization.py`:
+
+- reads `example/manual_feature_selection.csv`
+- loads locked checkpoints
+- uses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
+- reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
+
+Before running it, edit the configuration block near the top of the script if you need a different CSV, model directory, dataset path, or permutation count.
+
+## 10. Practical reading of metrics
+
+Use the metrics like this:
+
+- `test_mae` / `test_r2`: the main final generalization result
+- internal CV metrics: development-set selection evidence
+- stability MAE: repeated split robustness inside development data
+- LOOCV metrics: sensitivity / literature-reference numbers only
+
+If a report or old notebook still shows compatibility aliases such as `mae_mean`, `mae_test_avg`, or `r2_test_avg`, treat them according to the metric-role notes in the current saved checkpoint, not according to older workflow descriptions.
