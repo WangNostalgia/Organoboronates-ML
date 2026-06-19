@@ -10,7 +10,9 @@ import pandas as pd
 
 from src.external_validation import (
     _discover_model_checkpoints,
+    _loaded_feature_count,
     ensemble_validation,
+    list_available_models,
     load_model,
 )
 
@@ -236,6 +238,44 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             load_model("SVR", n_features=3, models_dir=str(self.models_dir))
 
+    def test_loaded_feature_count_rejects_non_integral_metadata_with_context(self):
+        filepath = str(self.models_dir / "SVR" / "SVR_final_20240101_120000.joblib")
+        invalid_cases = (
+            (2.9, ["f1", "f2"]),
+            ("2", ["f1", "f2"]),
+            (True, ["f1"]),
+        )
+
+        for metadata, features in invalid_cases:
+            with self.subTest(metadata=metadata):
+                with self.assertRaises(ValueError) as context:
+                    _loaded_feature_count(
+                        {
+                            "features": features,
+                            "optimal_n_features": metadata,
+                        },
+                        filepath=filepath,
+                    )
+
+                message = str(context.exception)
+                self.assertIn(filepath, message)
+                self.assertIn(repr(metadata), message)
+                self.assertIn(f"len(features)={len(features)}", message)
+
+    def test_loaded_feature_count_accepts_python_and_numpy_integers(self):
+        for metadata in (2, np.int64(2)):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(
+                    _loaded_feature_count(
+                        {
+                            "features": ["f1", "f2"],
+                            "optimal_n_features": metadata,
+                        },
+                        filepath="checkpoint.joblib",
+                    ),
+                    2,
+                )
+
     def test_checkpoint_discovery_parses_final_token_in_model_name_once(self):
         model_name = "Catalyst_final_variant"
         model_dir = self.models_dir / model_name
@@ -269,6 +309,84 @@ class ExternalValidationTests(unittest.TestCase):
                 f"{model_name}_iteration_7_20240101_120000.joblib",
             },
         )
+
+    def test_list_available_models_prefers_current_nested_internal_cv_metrics(self):
+        write_checkpoint(
+            self.models_dir,
+            "SVR",
+            "final",
+            "20240101_120000",
+            ["f1", "f2"],
+            metrics={
+                "secondary": {
+                    "internal_cv": {
+                        "rkf_mae_mean": 1.1,
+                        "rkf_r2_mean": 0.81,
+                    },
+                },
+                "internal_cv": {
+                    "rkf_mae_mean": 2.2,
+                    "rkf_r2_mean": 0.72,
+                },
+                "rkf_mae_mean": 3.3,
+                "rkf_r2_mean": 0.63,
+                "rkf_mae_opt_mean": 4.4,
+                "rkf_r2_opt_mean": 0.54,
+            },
+        )
+
+        row = list_available_models(str(self.models_dir)).iloc[0]
+
+        self.assertEqual(row["rkf_mae"], 1.1)
+        self.assertEqual(row["rkf_r2"], 0.81)
+
+    def test_list_available_models_falls_back_through_supported_metric_schemas(self):
+        schemas = {
+            "DirectModel": (
+                {
+                    "internal_cv": {
+                        "rkf_mae_mean": 2.1,
+                        "rkf_r2_mean": 0.71,
+                    },
+                },
+                2.1,
+                0.71,
+            ),
+            "FlatCurrentModel": (
+                {
+                    "rkf_mae_mean": 3.1,
+                    "rkf_r2_mean": 0.61,
+                },
+                3.1,
+                0.61,
+            ),
+            "LegacyModel": (
+                {
+                    "rkf_mae_opt_mean": 4.1,
+                    "rkf_r2_opt_mean": 0.51,
+                },
+                4.1,
+                0.51,
+            ),
+        }
+        for model_name, (metrics, _, _) in schemas.items():
+            write_checkpoint(
+                self.models_dir,
+                model_name,
+                "final",
+                "20240101_120000",
+                ["f1"],
+                metrics=metrics,
+            )
+
+        records = list_available_models(str(self.models_dir)).set_index(
+            "model_name"
+        )
+
+        for model_name, (_, expected_mae, expected_r2) in schemas.items():
+            with self.subTest(model_name=model_name):
+                self.assertEqual(records.loc[model_name, "rkf_mae"], expected_mae)
+                self.assertEqual(records.loc[model_name, "rkf_r2"], expected_r2)
 
     def test_ensemble_uses_common_original_index_for_predictions_ids_and_targets(self):
         write_checkpoint(

@@ -42,6 +42,7 @@ import argparse
 import logging
 import warnings
 from datetime import datetime
+from numbers import Integral
 
 import numpy as np
 import pandas as pd
@@ -95,6 +96,21 @@ def _normalise_column_name(col: str) -> str:
 # Model discovery
 # ---------------------------------------------------------------------------
 
+def _available_model_metric(metrics: dict, metric_name: str, legacy_name: str):
+    """Read one discovery metric from current schemas before legacy flat data."""
+    metric_paths = (
+        ('secondary', 'internal_cv', metric_name),
+        ('internal_cv', metric_name),
+        (metric_name,),
+        (legacy_name,),
+    )
+    for path in metric_paths:
+        value = _nested_metric(metrics, path)
+        if value is not None:
+            return value
+    return None
+
+
 def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
     """
     Scan the models directory and return a DataFrame of all trained final models.
@@ -126,8 +142,12 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
                 'model_name': os.path.basename(model_dir),
                 'n_features': checkpoint['actual_n_features'],
                 'features': ', '.join(features) if features else 'N/A',
-                'rkf_mae': metrics.get('rkf_mae_opt_mean'),
-                'rkf_r2': metrics.get('rkf_r2_opt_mean'),
+                'rkf_mae': _available_model_metric(
+                    metrics, 'rkf_mae_mean', 'rkf_mae_opt_mean'
+                ),
+                'rkf_r2': _available_model_metric(
+                    metrics, 'rkf_r2_mean', 'rkf_r2_opt_mean'
+                ),
                 'filepath': checkpoint['path'],
             })
 
@@ -662,11 +682,17 @@ def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
     """Use len(features) as truth and reject contradictory saved metadata."""
     actual_count = len(model_info.get('features', []))
     metadata_count = model_info.get('optimal_n_features')
-    if metadata_count is not None and int(metadata_count) != actual_count:
-        source = f" in {filepath}" if filepath else ""
+    metadata_is_valid = (
+        isinstance(metadata_count, Integral)
+        and not isinstance(metadata_count, bool)
+    )
+    if metadata_count is not None and (
+        not metadata_is_valid or int(metadata_count) != actual_count
+    ):
+        source = filepath if filepath else "<unknown>"
         raise ValueError(
-            f"Inconsistent checkpoint feature metadata{source}: "
-            f"optimal_n_features={metadata_count}, "
+            f"Invalid or inconsistent checkpoint feature metadata in {source}: "
+            f"optimal_n_features={metadata_count!r}, "
             f"len(features)={actual_count}."
         )
     return actual_count

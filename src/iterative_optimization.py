@@ -1,4 +1,3 @@
-import glob
 import logging
 import os
 import re
@@ -30,35 +29,60 @@ plt.rcParams["font.family"] = "DejaVu Sans"
 def clean_old_versions(model_dir, keep_versions=2):
     """Keep only the newest final-model runs and matching iteration checkpoints."""
     logger = logging.getLogger(__name__)
-    final_pattern = re.compile(r"_final_(\d{8}_\d{6})\.joblib$")
-    iteration_pattern = re.compile(r"_iteration_\d+_(\d{8}_\d{6})\.joblib$")
-    artifact_pattern = re.compile(
-        r"(\d{8}_\d{6})(?:_(?:metrics|outliers))?\.[^.]+$"
+    model_name = os.path.basename(os.path.normpath(model_dir))
+    escaped_model_name = re.escape(model_name)
+    timestamp_pattern = r"(?P<timestamp>\d{8}_\d{6})"
+    final_pattern = re.compile(
+        rf"^{escaped_model_name}_final_{timestamp_pattern}\.joblib$"
     )
-    final_timestamps = set()
+    iteration_pattern = re.compile(
+        rf"^{escaped_model_name}_iteration_\d+_{timestamp_pattern}\.joblib$"
+    )
+    artifact_patterns = (
+        final_pattern,
+        re.compile(
+            rf"^{escaped_model_name}_final_{timestamp_pattern}_metrics\.txt$"
+        ),
+        iteration_pattern,
+        re.compile(
+            rf"^{escaped_model_name}_iteration_\d+_"
+            rf"{timestamp_pattern}_metrics\.txt$"
+        ),
+        re.compile(rf"^performance_history_{timestamp_pattern}\.(?:csv|png)$"),
+        re.compile(rf"^final_scatter_{timestamp_pattern}\.png$"),
+        re.compile(rf"^final_scatter_{timestamp_pattern}_outliers\.csv$"),
+    )
 
-    for filepath in glob.glob(os.path.join(model_dir, "*_final_*.joblib")):
-        match = final_pattern.search(os.path.basename(filepath))
-        if match:
-            final_timestamps.add(match.group(1))
+    matched_artifacts = []
+    final_timestamps = set()
+    iteration_timestamps = set()
+    for name in os.listdir(model_dir):
+        filepath = os.path.join(model_dir, name)
+        if not os.path.isfile(filepath):
+            continue
+        for pattern in artifact_patterns:
+            match = pattern.fullmatch(name)
+            if not match:
+                continue
+            timestamp = match.group("timestamp")
+            matched_artifacts.append((filepath, timestamp))
+            if pattern is final_pattern:
+                final_timestamps.add(timestamp)
+            elif pattern is iteration_pattern:
+                iteration_timestamps.add(timestamp)
+            break
 
     if final_timestamps:
         retained_timestamps = set(
             sorted(final_timestamps, reverse=True)[:keep_versions]
         )
     else:
-        iteration_timestamps = set()
-        for filepath in glob.glob(os.path.join(model_dir, "*_iteration_*.joblib")):
-            match = iteration_pattern.search(os.path.basename(filepath))
-            if match:
-                iteration_timestamps.add(match.group(1))
         retained_timestamps = set(
             sorted(iteration_timestamps, reverse=True)[:keep_versions]
         )
 
-    for filepath in glob.glob(os.path.join(model_dir, "*")):
-        match = artifact_pattern.search(os.path.basename(filepath))
-        if not match or match.group(1) in retained_timestamps:
+    for filepath, timestamp in matched_artifacts:
+        if timestamp in retained_timestamps:
             continue
         try:
             os.remove(filepath)
@@ -707,6 +731,8 @@ def iterative_optimization(
             rkf_r2=internal_cv["rkf_r2_mean"],
             precomputed_metrics=scatter_metrics,
         )
+
+        clean_old_versions(model_dir, keep_versions)
 
         logger.info(
             "%s complete | Final Test PRIMARY: MAE %.4f, R² %.4f | "

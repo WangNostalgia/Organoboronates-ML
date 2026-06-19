@@ -610,7 +610,8 @@ class IterativeBoundaryTests(unittest.TestCase):
 
     def test_clean_old_versions_keeps_two_complete_final_families(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            model_dir = Path(tmpdir)
+            model_dir = Path(tmpdir) / "SVR"
+            model_dir.mkdir()
             timestamps = [
                 "20240101_120000",
                 "20240102_120000",
@@ -652,6 +653,222 @@ class IterativeBoundaryTests(unittest.TestCase):
             self.assertFalse(
                 any(orphan_timestamp in name for name in remaining_names),
                 msg=f"orphan iteration was retained: {remaining_names}",
+            )
+
+    def test_clean_old_versions_is_model_scoped_and_whitelists_canonical_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_name = "SVR+Model"
+            model_dir = Path(tmpdir) / model_name
+            model_dir.mkdir()
+            old_timestamp = "20240101_120000"
+            retained_timestamp = "20240102_120000"
+            foreign_timestamp = "20990101_120000"
+
+            def create_complete_family(timestamp):
+                names = {
+                    f"{model_name}_iteration_1_{timestamp}.joblib",
+                    f"{model_name}_iteration_1_{timestamp}_metrics.txt",
+                    f"{model_name}_final_{timestamp}.joblib",
+                    f"{model_name}_final_{timestamp}_metrics.txt",
+                    f"performance_history_{timestamp}.csv",
+                    f"performance_history_{timestamp}.png",
+                    f"final_scatter_{timestamp}.png",
+                    f"final_scatter_{timestamp}_outliers.csv",
+                }
+                for name in names:
+                    (model_dir / name).touch()
+                return names
+
+            old_family = create_complete_family(old_timestamp)
+            retained_family = create_complete_family(retained_timestamp)
+            protected_names = {
+                f"RandomForest_final_{foreign_timestamp}.joblib",
+                f"RandomForest_final_{foreign_timestamp}_metrics.txt",
+                f"manual_notes_{old_timestamp}.txt",
+                f"{model_name}_final_{old_timestamp}.joblib.bak",
+                f"{model_name}_iteration_notes_{old_timestamp}.txt",
+                "README.txt",
+            }
+            for name in protected_names:
+                (model_dir / name).touch()
+
+            clean_old_versions(str(model_dir), keep_versions=1)
+
+            remaining_names = {path.name for path in model_dir.iterdir()}
+            self.assertTrue(retained_family.issubset(remaining_names))
+            self.assertTrue(old_family.isdisjoint(remaining_names))
+            self.assertTrue(protected_names.issubset(remaining_names))
+
+    def test_successful_lightweight_run_retains_latest_two_complete_families(self):
+        X, y = make_sentinel_dataset()
+        old_timestamp = "20240101_120000"
+        retained_timestamp = "20240102_120000"
+        new_timestamp = "20240103_120000"
+
+        def family_names(timestamp):
+            return {
+                f"SVR_iteration_1_{timestamp}.joblib",
+                f"SVR_iteration_1_{timestamp}_metrics.txt",
+                f"SVR_final_{timestamp}.joblib",
+                f"SVR_final_{timestamp}_metrics.txt",
+                f"performance_history_{timestamp}.csv",
+                f"performance_history_{timestamp}.png",
+                f"final_scatter_{timestamp}.png",
+                f"final_scatter_{timestamp}_outliers.csv",
+            }
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(
+                model_class,
+                X_arg.shape[1],
+                n_jobs=kwargs["n_jobs"],
+            )
+
+        def touch_performance_plot(history, model_name, output_path):
+            Path(output_path).touch()
+
+        def touch_performance_csv(history, output_path):
+            Path(output_path).touch()
+
+        def touch_scatter(**kwargs):
+            scatter_path = Path(kwargs["output_dir"]) / kwargs["output_name"]
+            scatter_path.touch()
+            scatter_path.with_name(
+                scatter_path.name.replace(".png", "_outliers.csv")
+            ).touch()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "models" / "SVR"
+            model_dir.mkdir(parents=True)
+            for timestamp in (old_timestamp, retained_timestamp):
+                for name in family_names(timestamp):
+                    (model_dir / name).touch()
+
+            with patch(
+                "src.iterative_optimization.os.getcwd",
+                return_value=tmpdir,
+            ), patch(
+                "src.iterative_optimization.setup_logger",
+                return_value=logging.getLogger("retention-order-test"),
+            ), patch(
+                "src.iterative_optimization.hyperparameter_optimization_and_training",
+                side_effect=fake_tuning,
+            ), patch(
+                "src.iterative_optimization.leave_one_out_validation",
+                return_value=(0.55, 1.25),
+            ), patch(
+                "src.iterative_optimization.plot_performance_history",
+                side_effect=touch_performance_plot,
+            ), patch(
+                "src.iterative_optimization.save_performance_history",
+                side_effect=touch_performance_csv,
+            ), patch(
+                "src.iterative_optimization.plot_scatter",
+                side_effect=touch_scatter,
+            ), patch(
+                "src.iterative_optimization.datetime",
+            ) as datetime_mock:
+                datetime_mock.now.return_value = real_datetime(
+                    2024, 1, 3, 12, 0, 0
+                )
+                iterative_optimization(
+                    {"SVR": SVR},
+                    X,
+                    y,
+                    n_trials=1,
+                    n_jobs=1,
+                    keep_versions=2,
+                    min_features=3,
+                )
+
+            remaining_names = {path.name for path in model_dir.iterdir()}
+            self.assertTrue(
+                family_names(old_timestamp).isdisjoint(remaining_names)
+            )
+            self.assertTrue(
+                family_names(retained_timestamp).issubset(remaining_names)
+            )
+            self.assertTrue(
+                family_names(new_timestamp).issubset(remaining_names)
+            )
+            self.assertEqual(
+                len(
+                    [
+                        name
+                        for name in remaining_names
+                        if name.startswith("SVR_final_")
+                        and name.endswith(".joblib")
+                    ]
+                ),
+                2,
+            )
+
+    def test_failed_scatter_does_not_prune_older_complete_families(self):
+        X, y = make_sentinel_dataset()
+        old_timestamp = "20240101_120000"
+        retained_timestamp = "20240102_120000"
+        new_timestamp = "20240103_120000"
+
+        def fake_tuning(model_class, X_arg, y_arg, **kwargs):
+            return make_artifacts(
+                model_class,
+                X_arg.shape[1],
+                n_jobs=kwargs["n_jobs"],
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "models" / "SVR"
+            model_dir.mkdir(parents=True)
+            for timestamp in (old_timestamp, retained_timestamp):
+                (model_dir / f"SVR_final_{timestamp}.joblib").touch()
+
+            with patch(
+                "src.iterative_optimization.os.getcwd",
+                return_value=tmpdir,
+            ), patch(
+                "src.iterative_optimization.setup_logger",
+                return_value=logging.getLogger("failed-retention-order-test"),
+            ), patch(
+                "src.iterative_optimization.hyperparameter_optimization_and_training",
+                side_effect=fake_tuning,
+            ), patch(
+                "src.iterative_optimization.leave_one_out_validation",
+                return_value=(0.55, 1.25),
+            ), patch(
+                "src.iterative_optimization.plot_performance_history",
+            ), patch(
+                "src.iterative_optimization.save_performance_history",
+            ), patch(
+                "src.iterative_optimization.plot_scatter",
+                side_effect=RuntimeError("scatter failed"),
+            ), patch(
+                "src.iterative_optimization.datetime",
+            ) as datetime_mock:
+                datetime_mock.now.return_value = real_datetime(
+                    2024, 1, 3, 12, 0, 0
+                )
+                with self.assertRaisesRegex(RuntimeError, "scatter failed"):
+                    iterative_optimization(
+                        {"SVR": SVR},
+                        X,
+                        y,
+                        n_trials=1,
+                        n_jobs=1,
+                        keep_versions=2,
+                        min_features=3,
+                    )
+
+            self.assertTrue(
+                (model_dir / f"SVR_final_{old_timestamp}.joblib").exists()
+            )
+            self.assertTrue(
+                (model_dir / f"SVR_final_{retained_timestamp}.joblib").exists()
+            )
+            self.assertTrue(
+                (model_dir / f"SVR_final_{new_timestamp}.joblib").exists()
+            )
+            self.assertFalse(
+                (model_dir / f"final_scatter_{new_timestamp}.png").exists()
             )
 
     def test_iterative_signature_and_main_parser_expose_only_current_selection_controls(self):
