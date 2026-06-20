@@ -10,7 +10,6 @@ Active references:
 
 - Conceptual workflow: [pipeline.md](pipeline.md)
 - Step-by-step execution guide: [user_manual.md](user_manual.md)
-- Agent guidance: [AGENTS.md](AGENTS.md)
 
 ## Requirements
 

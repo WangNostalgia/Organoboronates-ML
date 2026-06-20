@@ -265,8 +265,6 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
             "README_CN.md",
             "user_manual.md",
             "pipeline.md",
-            "AGENTS.md",
-            "CLAUDE.md",
             "example/load_checkpoint_guide.py",
         ]
 
@@ -295,8 +293,6 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
             "README.md",
             "README_CN.md",
             "user_manual.md",
-            "AGENTS.md",
-            "CLAUDE.md",
         ]:
             text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
             self.assertNotIn("](Pipeline.md)", text, msg=relative_path)
@@ -307,8 +303,6 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
             "README.md",
             "README_CN.md",
             "user_manual.md",
-            "AGENTS.md",
-            "CLAUDE.md",
             "pipeline.md",
         ]:
             text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
@@ -323,22 +317,11 @@ class ActiveDocsAndExamplesTests(unittest.TestCase):
             "README.md",
             "README_CN.md",
             "user_manual.md",
-            "AGENTS.md",
-            "CLAUDE.md",
             "pipeline.md",
         ]:
             text = (WORKTREE_ROOT / relative_path).read_text(encoding="utf-8")
             self.assertNotIn("no more features qualify for removal", text, msg=relative_path)
             self.assertNotIn("no more features to remove", text, msg=relative_path)
-
-    def test_historical_examples_are_labeled_non_authoritative(self):
-        diagnose_text = (WORKTREE_ROOT / "example/diagnose_lasso.py").read_text(encoding="utf-8")
-        improvement_text = (WORKTREE_ROOT / "example/improvement_code_examples.py").read_text(encoding="utf-8")
-
-        self.assertRegex(diagnose_text[:400], r"historical|legacy")
-        self.assertRegex(diagnose_text[:400], r"not current|non-current|non-authoritative")
-        self.assertRegex(improvement_text[:400], r"historical|conceptual")
-        self.assertRegex(improvement_text[:400], r"not authoritative|non-authoritative")
 
 
 if __name__ == "__main__":

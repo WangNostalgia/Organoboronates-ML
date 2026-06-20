@@ -1,5 +1,0 @@
-model_name,n_features
-SVR,4
-RandomForest,4
-KRR,4
-XGBoost,3

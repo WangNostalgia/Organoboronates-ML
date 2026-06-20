@@ -9,11 +9,15 @@ build/
 # Virtual environment
 .venv/
 .worktrees/
+.local_archive/
+.claude/
 
 # Model outputs (large binary files)
 models/
 *.joblib
 *.pkl
+output/
+catboost_info/
 
 # Optuna databases
 *.db
@@ -35,3 +39,6 @@ Thumbs.db
 # Output plots
 *.png
 !example/*.png
+
+# Local caches
+.pytest_cache/

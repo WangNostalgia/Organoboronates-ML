@@ -10,7 +10,6 @@
 
 - 概念流程：[pipeline.md](pipeline.md)
 - 操作手册：[user_manual.md](user_manual.md)
-- 代理说明：[AGENTS.md](AGENTS.md)
 
 ## 环境要求
 
