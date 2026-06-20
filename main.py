@@ -1,5 +1,6 @@
 # find and evaluate the best model and features
 import argparse
+import warnings
 
 
 SHOW_PROGRESS_BAR = True
@@ -39,18 +40,18 @@ def positive_int(value):
 def configure_runtime():
     import logging
     import os
-    import warnings
+    import warnings as runtime_warnings
 
     import optuna
 
     from src.logger_config import setup_logger
 
-    warnings.filterwarnings(
+    runtime_warnings.filterwarnings(
         "ignore",
         message="X does not have valid feature names",
         category=UserWarning,
     )
-    warnings.filterwarnings(
+    runtime_warnings.filterwarnings(
         "ignore",
         message="BaseEstimator._validate_data",
         category=FutureWarning,
@@ -112,7 +113,7 @@ def build_default_models():
         raise ImportError(
             "The default model registry requires additional packages that are "
             f"not installed: {missing}. Install the full environment with "
-            "'uv sync' or 'pip install -r requirements.txt' before training."
+            "'uv sync --locked' before training."
         )
 
     return {
@@ -231,22 +232,16 @@ def _select_feature_columns(data):
     ]
 
 
-def _set_optuna_runtime_default(optuna_jobs):
-    # iterative_optimization imports the function object directly. Mutating the
-    # default keeps this CLI wiring minimal without changing unrelated pipeline
-    # signatures in this focused fix.
-    import src.hyperparameter_optimization_and_training as hot
-
-    defaults = list(hot.hyperparameter_optimization_and_training.__defaults__)
-    defaults[-1] = int(optuna_jobs)
-    hot.hyperparameter_optimization_and_training.__defaults__ = tuple(defaults)
-
-
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
 
     if args.n_jobs is not None:
+        warnings.warn(
+            "--n_jobs is deprecated; use --model_jobs instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         args.model_jobs = args.n_jobs
 
     if args.force_n_features is not None and "GPlearn" in DEFAULT_MODEL_NAMES:
@@ -258,7 +253,6 @@ def main():
         )
 
     configure_runtime()
-    _set_optuna_runtime_default(args.optuna_jobs)
 
     import pandas as pd
 
@@ -299,6 +293,7 @@ def main():
         y,
         n_trials=args.n_trials,
         n_jobs=args.model_jobs,
+        optuna_jobs=args.optuna_jobs,
         keep_versions=args.keep_versions,
         min_features=args.min_features,
         custom_min_features=custom_model_min_features,
