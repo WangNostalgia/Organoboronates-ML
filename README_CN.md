@@ -14,15 +14,15 @@
 ## 环境要求
 
 - Python >= 3.12
-- 推荐安装：`uv sync`
-- 备用安装：`pip install -r requirements.txt`
+- 推荐且可复现的安装方式：`uv sync --locked`
+- `requirements.txt` 只是从 lockfile 导出的 pip 兼容快照，不应手写维护，也不应作为第二套依赖真相源。
 
 默认完整环境除 scikit-learn 系列外，还需要 XGBoost、LightGBM、CatBoost，以及 `gplearn==0.4.2`。
 
 ## 快速开始
 
 ```bash
-uv sync
+uv sync --locked
 python main.py --n_trials 100 --min_features 5
 python main.py --n_trials 20 --min_features 5
 python main.py --help
@@ -79,13 +79,13 @@ python example/standalone_y_randomization.py
 - 若存在高相关特征对，先删 SHAP 更弱的那个
 - 否则删全局最不重要的特征
 
-因此路径会一直走到配置下限。`--min_features` 默认值是 `5`。
+路径会持续到配置的特征数下限。`--min_features` 默认是 `5`。
 
-`--force_n_features` 的语义仍然是“先评估路径，再选精确特征数”，但由于默认 registry 含 GPlearn，`main.py` 会在最开始直接拒绝该选项。只有自定义且不含 GPlearn 的 registry 才适合精确特征数强制选择。
+`--force_n_features` 表示“先评估完整路径，再强制选择某个已评估的特征数”。但默认注册表仍包含 GPlearn，因此 `main.py` 会立即拒绝这个选项；精确特征数强制选择只适用于排除 GPlearn 的自定义注册表。
 
 ### 4. 指标角色与 checkpoint schema
 
-Final checkpoint 使用嵌套指标结构：
+Final checkpoints 使用嵌套指标：
 
 - `metrics.primary.final_test.test_mae`
 - `metrics.primary.final_test.test_r2`
@@ -93,54 +93,57 @@ Final checkpoint 使用嵌套指标结构：
 - `metrics.secondary.stability.*`
 - `metrics.secondary.loo.*`
 
-Iteration checkpoint 保留扁平 development-path 指标：
+Iteration checkpoints 保存 development 路径指标：
 
 - `metrics.internal_cv.*`
 - `metrics.stability.*`
 - `metrics.loo.*`
 
-旧别名仍可能为了兼容而保留，但读取时应优先使用当前键，再回退到旧别名。
+兼容旧字段可能仍会出现，但当前读取逻辑应优先使用新字段，只在必要时 fallback。
 
-### 5. 独立 y-randomization
+### 5. Standalone y-randomization
 
-自动主流程 y-randomization 仍然关闭。当前支持方式是 `example/standalone_y_randomization.py`，它会：
+主流程中仍不自动运行 full-pipeline y-randomization。支持的路径是 `example/standalone_y_randomization.py`，该脚本：
 
-- 读取已锁定 checkpoint
-- 让原始标签与置乱标签复用同一组预计算 5×5 RepeatedKFold splits
-- 输出修正后的有限置换 p 值 `(b + 1) / (m + 1)`
-- 将直方图写入根模型目录 `models/y_randomization_<ModelName>.png`
+- 加载已选 checkpoint
+- 默认只使用 checkpoint 中保存的 development indices
+- 对真实标签和随机标签复用同一组预计算的 5×5 RepeatedKFold split
+- 报告有限置换修正 p-value `(b + 1) / (m + 1)`
+- 将直方图写入 `models/y_randomization_<ModelName>.png`
 
 ### 6. Checkpoint 加载
 
-`src.external_validation.load_model()` 的规则是：
+`src.external_validation.load_model()`：
 
-- 同时搜索 final 与 iteration checkpoint
-- 默认要求精确特征数
-- 精确匹配时 final 优先于 iteration
-- 同类候选按文件名时间戳确定性排序
-- 只有显式使用 `allow_closest=True` / `--allow-closest` 才允许最近邻回退
+- 同时搜索 final 和 iteration checkpoints
+- 默认要求特征数精确匹配
+- 精确匹配时优先 final checkpoint，而不是 iteration checkpoint
+- 用文件名 timestamp 打破平局
+- 只有在 `allow_closest=True` / `--allow-closest` 时才允许最近特征数 fallback
 
-`example/load_checkpoint_guide.py` 与这套规则保持一致，并能安全格式化当前键和旧别名。
+`example/load_checkpoint_guide.py` 使用同样的选择逻辑，并能安全格式化当前和旧版指标布局。
 
-### 7. Applicability Domain
+### 7. Applicability domain
 
-AD 当前使用：
+Applicability-domain 分析默认使用 checkpoint development indices 进行校准，并使用：
 
 - 训练集 5-fold OOF residuals
-- 基于 MAD 的残差尺度与有限回退
-- 描述符空间 leverage
+- MAD-based residual scale，并带有限值 fallback
+- descriptor space leverage
 
-如果外部数据没有真实标签，预测模式会退化为 leverage-only；不会使用外部 `sqrt(1-h)` 修正项。
+当外部数据没有标签时，prediction-only mode 只使用 leverage；没有外部 `sqrt(1-h)` 修正项。
 
 ## `main.py` CLI 参数
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `--n_trials` | `100` | development 集上的 Optuna trial 数 |
-| `--n_jobs` | `-1` | CPU 核数（`-1` 表示全部可用） |
-| `--keep_versions` | `2` | 每个模型保留的最近 checkpoint 家族数 |
-| `--min_features` | `5` | SHAP-RFECV 路径评估下限 |
-| `--force_n_features` | `None` | 精确特征数选择；默认 GPlearn registry 下会被 `main.py` 直接拒绝 |
+| `--n_trials` | `100` | 每个模型在 development 集上的 Optuna trial 数 |
+| `--model_jobs` | `-1` | 模型内部并行 CPU 数；`-1` 表示支持时使用全部可用核心 |
+| `--optuna_jobs` | `1` | Optuna trial 并行数；默认串行以提高可复现性并避免资源爆炸 |
+| `--n_jobs` | `None` | 已废弃的 `--model_jobs` 别名 |
+| `--keep_versions` | `2` | 每个模型保留的最近 checkpoint family 数量 |
+| `--min_features` | `5` | SHAP-RFECV 路径评估的特征数下限 |
+| `--force_n_features` | `None` | 精确选择已评估特征数；默认 GPlearn 注册表下会被拒绝 |
 
 ## 输出结构
 
@@ -151,6 +154,8 @@ models/
 │   ├── <ModelName>_iteration_<N>_<timestamp>_metrics.txt
 │   ├── <ModelName>_final_<timestamp>.joblib
 │   ├── <ModelName>_final_<timestamp>_metrics.txt
+│   ├── <ModelName>_manual_final_<N>feat_<timestamp>.joblib
+│   ├── <ModelName>_manual_final_<N>feat_<timestamp>_metrics.txt
 │   ├── final_scatter_<timestamp>.png
 │   ├── final_scatter_<timestamp>_outliers.csv
 │   ├── performance_history_<timestamp>.csv
@@ -158,13 +163,14 @@ models/
 └── optimization_<timestamp>.log
 ```
 
-Iteration checkpoint 保存 development-path 结果；final checkpoint 额外保存一次性的 final-test 结果、split 元数据、拟合后的 scalers、合并后的超参数以及最终特征顺序。
+Iteration checkpoints 保存 development 路径结果。Final checkpoints 额外保存一次性 final-test 结果、split metadata、已拟合 scaler、完整超参数以及最终特征顺序。Manual-final checkpoints 使用相同 final-test 协议，但特征数来自 `example/manual_feature_selection.csv`。
 
-## 复现说明
+## 可复现性说明
 
-- development/final split 固定种子：`40`
-- development 内部评估固定种子：`42`
-- 目标值不裁剪
-- 优化流程使用 `Agg` backend
-- `src/fixed_params.py` 是固定参数单一真源
-- `src/evaluation.py` 是 5×5 RepeatedKFold 评估单一真源
+- 固定 development/final split seed：`40`
+- 固定 development 侧评估 seed：`42`
+- 不裁剪 target values
+- 优化流程中 Matplotlib 使用 `Agg` backend
+- `src/fixed_params.py` 是固定模型参数的单一来源
+- `src/evaluation.py` 是 5×5 RepeatedKFold 评估的单一来源
+- `uv.lock` 是精确依赖解析的单一来源；需要 pip 兼容时再从 lockfile 导出 `requirements.txt`
