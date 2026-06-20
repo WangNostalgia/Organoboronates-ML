@@ -21,3 +21,10 @@ dependencies = [
     "catboost>=1.2",
     "gplearn==0.4.2",
 ]
+
+[project.optional-dependencies]
+torchsisso = [
+    "torch>=2.2",
+    "TorchSisso>=0.1.8",
+    "sympy>=1.12",
+]
