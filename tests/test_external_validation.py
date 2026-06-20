@@ -12,6 +12,7 @@ from src.external_validation import (
     _discover_model_checkpoints,
     _loaded_feature_count,
     ensemble_validation,
+    external_validation,
     list_available_models,
     load_model,
 )
@@ -109,6 +110,46 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(source.count("def main("), 1)
         self.assertNotIn("Load any final model by name", source)
         self.assertIn("Load final or iteration checkpoints", source)
+
+    def test_source_has_no_paired_substrate_identifiers(self):
+        source = Path("src/external_validation.py").read_text(encoding="utf-8")
+        self.assertNotIn("sub_H", source)
+        self.assertNotIn("sub_B", source)
+
+    def test_single_model_external_validation_preserves_current_metadata(self):
+        model_info = {
+            "model": ConstantPredictionModel(2.0),
+            "scaler_X": IdentityScaler(),
+            "scaler_y": IdentityScaler(),
+            "features": ["f1", "f2"],
+            "optimal_n_features": 2,
+            "metrics": {"rkf_mae_opt_mean": 1.0},
+        }
+        external_df = pd.DataFrame(
+            {
+                "ID": ["mol_1", "mol_2"],
+                "SMILES": ["CCB", "CCCB"],
+                "filename": ["mol_1.log", "mol_2.log"],
+                "activation_energy": [1.5, 2.5],
+                "f1": [0.1, 0.2],
+                "f2": [1.1, 1.2],
+            }
+        )
+
+        with patch("src.external_validation._plot_external_scatter", return_value=None):
+            results = external_validation(
+                model_info,
+                external_df,
+                output_dir=str(self.output_dir),
+                output_prefix="Model",
+            )
+
+        predictions = results["predictions"]
+        self.assertEqual(predictions["ID"].tolist(), ["mol_1", "mol_2"])
+        self.assertEqual(predictions["SMILES"].tolist(), ["CCB", "CCCB"])
+        self.assertEqual(predictions["filename"].tolist(), ["mol_1.log", "mol_2.log"])
+        self.assertEqual(predictions["predicted_activation_energy"].tolist(), [2.0, 2.0])
+        self.assertIn("absolute_error", predictions.columns)
 
     def test_load_model_exact_final_preferred_over_iteration(self):
         write_checkpoint(
@@ -298,10 +339,7 @@ class ExternalValidationTests(unittest.TestCase):
         for features in invalid_features:
             with self.subTest(features=features):
                 with self.assertRaises(ValueError) as context:
-                    _loaded_feature_count(
-                        {"features": features},
-                        filepath=filepath,
-                    )
+                    _loaded_feature_count({"features": features}, filepath=filepath)
 
                 message = str(context.exception)
                 self.assertIn(filepath, message)
@@ -327,9 +365,7 @@ class ExternalValidationTests(unittest.TestCase):
         corrupt_path.write_bytes(corrupt_bytes[: len(corrupt_bytes) // 2])
 
         with patch("src.external_validation.logger.warning") as warning_mock:
-            checkpoints = _discover_model_checkpoints(
-                str(self.models_dir / "SVR")
-            )
+            checkpoints = _discover_model_checkpoints(str(self.models_dir / "SVR"))
 
         self.assertEqual([Path(item["path"]) for item in checkpoints], [final_path])
         warning_mock.assert_called_once()
@@ -354,9 +390,7 @@ class ExternalValidationTests(unittest.TestCase):
         joblib.dump(KeyErrorDuringLoad(), corrupt_path)
 
         with patch("src.external_validation.logger.warning") as warning_mock:
-            checkpoints = _discover_model_checkpoints(
-                str(self.models_dir / "SVR")
-            )
+            checkpoints = _discover_model_checkpoints(str(self.models_dir / "SVR"))
 
         self.assertEqual([Path(item["path"]) for item in checkpoints], [final_path])
         warning_mock.assert_called_once()
@@ -490,9 +524,7 @@ class ExternalValidationTests(unittest.TestCase):
                 metrics=metrics,
             )
 
-        records = list_available_models(str(self.models_dir)).set_index(
-            "model_name"
-        )
+        records = list_available_models(str(self.models_dir)).set_index("model_name")
 
         for model_name, (_, expected_mae, expected_r2) in schemas.items():
             with self.subTest(model_name=model_name):
@@ -529,8 +561,9 @@ class ExternalValidationTests(unittest.TestCase):
 
         external_df = pd.DataFrame(
             {
-                "sub_H": ["H0", "H1", "H2", "H3"],
-                "sub_B": ["B0", "B1", "B2", "B3"],
+                "ID": ["mol_0", "mol_1", "mol_2", "mol_3"],
+                "SMILES": ["C", "CC", "CCC", "CCCC"],
+                "filename": ["mol_0.log", "mol_1.log", "mol_2.log", "mol_3.log"],
                 "activation_energy": [10.0, 20.0, 30.0, 40.0],
                 "f1": [0.1, np.nan, 0.3, 0.4],
                 "f2": [1.0, 1.1, 1.2, 1.3],
@@ -549,8 +582,9 @@ class ExternalValidationTests(unittest.TestCase):
 
         predictions = results["predictions"]
 
-        self.assertEqual(predictions["sub_H"].tolist(), ["H0", "H3"])
-        self.assertEqual(predictions["sub_B"].tolist(), ["B0", "B3"])
+        self.assertEqual(predictions["ID"].tolist(), ["mol_0", "mol_3"])
+        self.assertEqual(predictions["SMILES"].tolist(), ["C", "CCCC"])
+        self.assertEqual(predictions["filename"].tolist(), ["mol_0.log", "mol_3.log"])
         self.assertEqual(predictions["activation_energy"].tolist(), [10.0, 40.0])
         self.assertEqual(predictions["predicted_mean"].tolist(), [2.0, 2.0])
         self.assertEqual(predictions["predicted_weighted"].tolist(), [2.0, 2.0])
@@ -677,10 +711,7 @@ class ExternalValidationTests(unittest.TestCase):
             models_dir=str(self.models_dir),
         )
 
-        self.assertAlmostEqual(
-            results["predictions"]["predicted_weighted"].iloc[0],
-            1.4,
-        )
+        self.assertAlmostEqual(results["predictions"]["predicted_weighted"].iloc[0], 1.4)
 
     def test_ensemble_invalid_weight_metric_is_recorded_without_nan_output(self):
         write_checkpoint(
@@ -690,9 +721,7 @@ class ExternalValidationTests(unittest.TestCase):
             "20240103_120000",
             ["f1"],
             prediction=2.0,
-            metrics={
-                "secondary": {"internal_cv": {"rkf_mae_mean": 1.0}},
-            },
+            metrics={"secondary": {"internal_cv": {"rkf_mae_mean": 1.0}}},
         )
         write_checkpoint(
             self.models_dir,
@@ -753,7 +782,7 @@ class ExternalValidationTests(unittest.TestCase):
         ).to_csv(ensemble_spec, index=False)
         external_df = pd.DataFrame(
             {
-                "sub_H": ["H0", "H1", "H2"],
+                "ID": ["mol_0", "mol_1", "mol_2"],
                 "activation_energy": [10.0, 20.0, 30.0],
                 "f1": [0.1, 0.2, 0.3],
                 "f2": [1.1, 1.2, 1.3],
@@ -772,22 +801,14 @@ class ExternalValidationTests(unittest.TestCase):
         predictions = results["predictions"]
         self.assertEqual(predictions.index.tolist(), [7, 7, 8])
         self.assertEqual(predictions["original_index"].tolist(), [7, 7, 8])
-        self.assertEqual(predictions["sub_H"].tolist(), ["H0", "H1", "H2"])
+        self.assertEqual(predictions["ID"].tolist(), ["mol_0", "mol_1", "mol_2"])
         self.assertEqual(predictions["activation_energy"].tolist(), [10.0, 20.0, 30.0])
         self.assertEqual(predictions["predicted_weighted"].tolist(), [2.0, 2.0, 2.0])
 
     def test_ensemble_member_with_no_complete_rows_fails_before_scaler_transform(self):
-        write_checkpoint(
-            self.models_dir,
-            "ModelA",
-            "final",
-            "20240103_120000",
-            ["f1"],
-        )
+        write_checkpoint(self.models_dir, "ModelA", "final", "20240103_120000", ["f1"])
         ensemble_spec = Path(self.tmpdir.name) / "all_nan_ensemble.csv"
-        pd.DataFrame(
-            [{"model_name": "ModelA", "n_features": 1}]
-        ).to_csv(ensemble_spec, index=False)
+        pd.DataFrame([{"model_name": "ModelA", "n_features": 1}]).to_csv(ensemble_spec, index=False)
 
         with self.assertRaisesRegex(RuntimeError, r"ModelA.*no complete rows"):
             ensemble_validation(
@@ -799,20 +820,8 @@ class ExternalValidationTests(unittest.TestCase):
             )
 
     def test_ensemble_disjoint_member_rows_raise_clear_domain_error(self):
-        write_checkpoint(
-            self.models_dir,
-            "ModelA",
-            "final",
-            "20240103_120000",
-            ["f1"],
-        )
-        write_checkpoint(
-            self.models_dir,
-            "ModelB",
-            "final",
-            "20240104_120000",
-            ["f2"],
-        )
+        write_checkpoint(self.models_dir, "ModelA", "final", "20240103_120000", ["f1"])
+        write_checkpoint(self.models_dir, "ModelB", "final", "20240104_120000", ["f2"])
         ensemble_spec = Path(self.tmpdir.name) / "disjoint_ensemble.csv"
         pd.DataFrame(
             [
@@ -827,9 +836,7 @@ class ExternalValidationTests(unittest.TestCase):
         ):
             ensemble_validation(
                 ensemble_csv=str(ensemble_spec),
-                external_data=pd.DataFrame(
-                    {"f1": [1.0, np.nan], "f2": [np.nan, 2.0]}
-                ),
+                external_data=pd.DataFrame({"f1": [1.0, np.nan], "f2": [np.nan, 2.0]}),
                 target_col=None,
                 output_dir=str(self.output_dir),
                 models_dir=str(self.models_dir),
