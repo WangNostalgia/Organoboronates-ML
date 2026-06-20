@@ -7,7 +7,7 @@ on completely independent, unseen data.
 
 Key capabilities:
   - List all trained models with their metrics and feature counts
-  - Load final or iteration checkpoints by name and desired feature count
+  - Load final, manual-final, or iteration checkpoints by name and feature count
   - Align external CSV columns to the model's expected feature set
   - Preserve metadata columns such as ID, SMILES, filename, conformer labels, and source files
   - Predict activation energies on new data
@@ -111,6 +111,19 @@ def _metadata_columns(df: pd.DataFrame,
     return _unique_preserving_order(preferred + extra)
 
 
+def _metadata_target_for_output(df: pd.DataFrame, target_col: str | None) -> str | None:
+    """Exclude an existing target column from metadata even in predict-only mode."""
+    if target_col is not None:
+        return target_col
+    if DEFAULT_TARGET_COL in df.columns:
+        logger.warning(
+            "Predict-only mode requested but column '%s' is present; preserving final-test discipline by not using it for metrics and not treating it as metadata.",
+            DEFAULT_TARGET_COL,
+        )
+        return DEFAULT_TARGET_COL
+    return None
+
+
 def _nested_metric(mapping: dict, path: Sequence[str]):
     value = mapping
     for key in path:
@@ -135,7 +148,7 @@ def _available_model_metric(metrics: dict, metric_name: str, legacy_name: str):
 
 
 def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
-    """Scan the models directory and return all trained final checkpoints."""
+    """Scan the models directory and return trained final/manual-final checkpoints."""
     if not os.path.isdir(models_dir):
         raise FileNotFoundError(f"Models directory not found: {models_dir}")
 
@@ -144,13 +157,14 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
         if not os.path.isdir(model_dir):
             continue
         for checkpoint in _discover_model_checkpoints(model_dir):
-            if checkpoint['checkpoint_type'] != 'final':
+            if checkpoint['checkpoint_type'] not in {'final', 'manual_final'}:
                 continue
             info = checkpoint['model_info']
             features = info.get('features', [])
             metrics = info.get('metrics', {})
             records.append({
                 'model_name': os.path.basename(model_dir),
+                'checkpoint_type': checkpoint['checkpoint_type'],
                 'n_features': checkpoint['actual_n_features'],
                 'features': ', '.join(features) if features else 'N/A',
                 'rkf_mae': _available_model_metric(metrics, 'rkf_mae_mean', 'rkf_mae_opt_mean'),
@@ -160,10 +174,10 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
 
     if not records:
         raise FileNotFoundError(
-            f"No *_final_*.joblib files found under {models_dir}. Run main.py first to train models."
+            f"No *_final_*.joblib or *_manual_final_*feat_*.joblib files found under {models_dir}. Run main.py or manual_selection_and_plot.py first."
         )
 
-    return pd.DataFrame(records).sort_values('model_name').reset_index(drop=True)
+    return pd.DataFrame(records).sort_values(['model_name', 'checkpoint_type']).reset_index(drop=True)
 
 
 def external_validation(model_info: dict,
@@ -236,10 +250,11 @@ def external_validation(model_info: dict,
     y_pred_scaled = model.predict(X_scaled)
     y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
 
+    metadata_target_col = _metadata_target_for_output(df, target_col)
     metadata_cols = _metadata_columns(
         df,
         expected_features=expected_features,
-        target_col=target_col,
+        target_col=metadata_target_col,
         id_cols=id_cols,
         preserve_all_metadata=preserve_all_metadata,
     )
@@ -374,11 +389,15 @@ def _write_external_summary(path, model_name, model_info, n_features,
 
 
 def _checkpoint_filename_match(filepath: str, model_name: str = None):
-    """Match one canonical checkpoint filename using an anchored model prefix."""
+    """Match canonical automatic, manual-final, or iteration checkpoints."""
     canonical_name = model_name or os.path.basename(os.path.dirname(filepath))
     pattern = re.compile(
         rf"^{re.escape(canonical_name)}_"
-        r"(?:(?P<final>final)|iteration_(?P<iteration>\d+))_"
+        r"(?:"
+        r"(?P<final>final)_"
+        r"|manual_final_(?P<manual_n_features>\d+)feat_"
+        r"|iteration_(?P<iteration>\d+)_"
+        r")"
         r"(?P<timestamp>\d{8}_\d{6})\.joblib$"
     )
     return pattern.fullmatch(os.path.basename(filepath))
@@ -395,7 +414,11 @@ def _checkpoint_type_from_path(filepath: str, model_name: str = None) -> str:
     match = _checkpoint_filename_match(filepath, model_name)
     if not match:
         raise ValueError(f"Unrecognised checkpoint filename format: {filepath}")
-    return 'final' if match.group('final') else 'iteration'
+    if match.group('final'):
+        return 'final'
+    if match.group('manual_n_features'):
+        return 'manual_final'
+    return 'iteration'
 
 
 def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
@@ -429,6 +452,15 @@ def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
             f"Invalid or inconsistent checkpoint feature metadata in {source}: "
             f"optimal_n_features={metadata_count!r}, len(features)={actual_count}."
         )
+
+    match = _checkpoint_filename_match(source) if filepath else None
+    if match and match.group('manual_n_features'):
+        filename_count = int(match.group('manual_n_features'))
+        if filename_count != actual_count:
+            raise ValueError(
+                f"Invalid manual-final checkpoint filename in {source}: "
+                f"filename feature count={filename_count}, len(features)={actual_count}."
+            )
     return actual_count
 
 
@@ -441,28 +473,35 @@ def _discover_model_checkpoints(model_dir: str) -> list[dict]:
             continue
         try:
             info = joblib.load(filepath)
-            actual_n_features = _loaded_feature_count(info, filepath=filepath)
-            checkpoints.append({
-                'path': filepath,
-                'model_info': info,
-                'checkpoint_type': _checkpoint_type_from_path(filepath, model_name),
-                'timestamp': _checkpoint_timestamp_from_path(filepath, model_name),
-                'actual_n_features': actual_n_features,
-            })
         except Exception as exc:
             logger.warning(
                 "Skipping unreadable checkpoint %s: %s", filepath, exc.__class__.__name__
             )
+            continue
+
+        actual_n_features = _loaded_feature_count(info, filepath=filepath)
+        checkpoints.append({
+            'path': filepath,
+            'model_info': info,
+            'checkpoint_type': _checkpoint_type_from_path(filepath, model_name),
+            'timestamp': _checkpoint_timestamp_from_path(filepath, model_name),
+            'actual_n_features': actual_n_features,
+        })
     return checkpoints
 
 
 def _checkpoint_priority(checkpoint: dict) -> int:
-    return 0 if checkpoint['checkpoint_type'] == 'final' else 1
+    priorities = {
+        'final': 0,
+        'manual_final': 1,
+        'iteration': 2,
+    }
+    return priorities.get(checkpoint['checkpoint_type'], 99)
 
 
 def _best_checkpoint(checkpoints: list[dict]) -> dict:
     if not checkpoints:
-        raise FileNotFoundError("No final or iteration checkpoints found")
+        raise FileNotFoundError("No final, manual-final, or iteration checkpoints found")
     top_priority = min(_checkpoint_priority(item) for item in checkpoints)
     priority_candidates = [item for item in checkpoints if _checkpoint_priority(item) == top_priority]
     latest_timestamp = max(item['timestamp'] for item in priority_candidates)
@@ -475,7 +514,7 @@ def _best_checkpoint(checkpoints: list[dict]) -> dict:
 
 def _select_checkpoint(checkpoints: list[dict], n_features: int = None, allow_closest: bool = False) -> dict:
     if not checkpoints:
-        raise FileNotFoundError("No final or iteration checkpoints found")
+        raise FileNotFoundError("No final, manual-final, or iteration checkpoints found")
     if n_features is None:
         return _best_checkpoint(checkpoints)
     exact = [item for item in checkpoints if item['actual_n_features'] == n_features]
@@ -495,14 +534,14 @@ def _select_checkpoint(checkpoints: list[dict], n_features: int = None, allow_cl
 def load_model(model_name: str, n_features: int = None,
                models_dir: str = DEFAULT_MODELS_DIR,
                allow_closest: bool = False) -> dict:
-    """Load final or iteration checkpoints by model name and feature count."""
+    """Load final, manual-final, or iteration checkpoints by model name and feature count."""
     model_dir = os.path.join(models_dir, model_name)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
     checkpoints = _discover_model_checkpoints(model_dir)
     if not checkpoints:
         raise FileNotFoundError(
-            f"No final or iteration checkpoints found for {model_name} in {model_dir}"
+            f"No final, manual-final, or iteration checkpoints found for {model_name} in {model_dir}"
         )
     selected = _select_checkpoint(checkpoints, n_features=n_features, allow_closest=allow_closest)
     info = selected['model_info']
@@ -706,10 +745,11 @@ def ensemble_validation(ensemble_csv: str,
     y_pred_weighted = prediction_frame.dot(weight_array)
     excluded_rows = len(df_external) - len(prediction_frame)
 
+    metadata_target_col = _metadata_target_for_output(df_external, target_col)
     metadata_cols = _metadata_columns(
         df_external,
         expected_features=all_expected_features,
-        target_col=target_col,
+        target_col=metadata_target_col,
         id_cols=id_cols,
         preserve_all_metadata=preserve_all_metadata,
     )
