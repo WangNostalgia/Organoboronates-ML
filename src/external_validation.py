@@ -3,37 +3,17 @@ External Validation Module for Organoboronate ML Models
 ========================================================
 
 Provides a reusable CLI and Python API for evaluating trained `.joblib` models
-on completely independent, unseen data (external validation).
+on completely independent, unseen data.
 
 Key capabilities:
   - List all trained models with their metrics and feature counts
   - Load final or iteration checkpoints by name and desired feature count
   - Align external CSV columns to the model's expected feature set
-  - Preserve single-fragment metadata columns such as ID, SMILES, and filename
+  - Preserve metadata columns such as ID, SMILES, filename, conformer labels, and source files
   - Predict activation energies on new data
   - Calculate MAE, R², RMSE when ground-truth `activation_energy` is present
   - Generate prediction-vs-experiment scatter plots
   - Export predictions to CSV
-
-Usage (CLI):
-  # List all trained models and their feature counts
-  python src/external_validation.py --list-models
-
-  # Run external validation with a specific model
-  python src/external_validation.py --model SVR --data external_data.csv
-
-  # Run with a specific feature count (optional)
-  python src/external_validation.py --model SVR --n_features 5 --data external_data.csv
-
-  # Prediction-only mode (no ground truth column in the CSV)
-  python src/external_validation.py --model SVR --data new_compounds.csv --predict-only
-
-Usage (Python API):
-  >>> from src.external_validation import list_available_models, load_model, external_validation
-  >>> models_df = list_available_models()
-  >>> model_info = load_model('SVR', n_features=4)
-  >>> results = external_validation(model_info, 'external_data.csv')
-  >>> print(f"MAE={results['mae']:.2f}, R²={results['r2']:.3f}")
 """
 
 import argparse
@@ -68,7 +48,7 @@ warnings.filterwarnings(
 DEFAULT_MODELS_DIR = 'models'
 DEFAULT_TARGET_COL = 'activation_energy'
 DEFAULT_OUTPUT_DIR = 'external_validation_results'
-DEFAULT_METADATA_COLUMNS = ('ID', 'SMILES', 'filename')
+DEFAULT_ID_COLS = ('ID', 'SMILES', 'filename')
 
 
 class EnsembleValidationError(RuntimeError):
@@ -87,9 +67,12 @@ def _normalise_column_name(col: str) -> str:
     return FEATURE_ALIASES.get(col, col)
 
 
-def _identifier_columns(df: pd.DataFrame) -> list[str]:
-    """Return current single-fragment metadata columns present in df."""
-    return [col for col in DEFAULT_METADATA_COLUMNS if col in df.columns]
+def _coerce_id_cols(id_cols=None) -> tuple[str, ...]:
+    if id_cols is None:
+        return DEFAULT_ID_COLS
+    if isinstance(id_cols, str):
+        return tuple(col.strip() for col in id_cols.split(',') if col.strip())
+    return tuple(str(col).strip() for col in id_cols if str(col).strip())
 
 
 def _unique_preserving_order(columns: Sequence[str]) -> list[str]:
@@ -102,6 +85,32 @@ def _unique_preserving_order(columns: Sequence[str]) -> list[str]:
     return result
 
 
+def _metadata_columns(df: pd.DataFrame,
+                      expected_features: Sequence[str],
+                      target_col: str | None = DEFAULT_TARGET_COL,
+                      id_cols=None,
+                      preserve_all_metadata: bool = True) -> list[str]:
+    """
+    Return metadata columns to preserve in prediction outputs.
+
+    Preferred identity columns, such as ID/SMILES/filename, are placed first.
+    By default, all additional non-feature, non-target columns are kept as
+    metadata so external predictions remain traceable even when users add
+    conformer IDs, source paths, batch labels, or other annotations.
+    """
+    feature_set = set(expected_features)
+    excluded = set(feature_set)
+    if target_col is not None:
+        excluded.add(target_col)
+
+    preferred = [col for col in _coerce_id_cols(id_cols) if col in df.columns and col not in excluded]
+    if not preserve_all_metadata:
+        return _unique_preserving_order(preferred)
+
+    extra = [col for col in df.columns if col not in excluded and col not in preferred]
+    return _unique_preserving_order(preferred + extra)
+
+
 def _nested_metric(mapping: dict, path: Sequence[str]):
     value = mapping
     for key in path:
@@ -112,7 +121,6 @@ def _nested_metric(mapping: dict, path: Sequence[str]):
 
 
 def _available_model_metric(metrics: dict, metric_name: str, legacy_name: str):
-    """Read one discovery metric from current schemas before legacy flat data."""
     metric_paths = (
         ('secondary', 'internal_cv', metric_name),
         ('internal_cv', metric_name),
@@ -145,19 +153,14 @@ def list_available_models(models_dir: str = DEFAULT_MODELS_DIR) -> pd.DataFrame:
                 'model_name': os.path.basename(model_dir),
                 'n_features': checkpoint['actual_n_features'],
                 'features': ', '.join(features) if features else 'N/A',
-                'rkf_mae': _available_model_metric(
-                    metrics, 'rkf_mae_mean', 'rkf_mae_opt_mean'
-                ),
-                'rkf_r2': _available_model_metric(
-                    metrics, 'rkf_r2_mean', 'rkf_r2_opt_mean'
-                ),
+                'rkf_mae': _available_model_metric(metrics, 'rkf_mae_mean', 'rkf_mae_opt_mean'),
+                'rkf_r2': _available_model_metric(metrics, 'rkf_r2_mean', 'rkf_r2_opt_mean'),
                 'filepath': checkpoint['path'],
             })
 
     if not records:
         raise FileNotFoundError(
-            f"No *_final_*.joblib files found under {models_dir}. "
-            "Run main.py first to train models."
+            f"No *_final_*.joblib files found under {models_dir}. Run main.py first to train models."
         )
 
     return pd.DataFrame(records).sort_values('model_name').reset_index(drop=True)
@@ -167,7 +170,9 @@ def external_validation(model_info: dict,
                         external_data,
                         target_col: str = DEFAULT_TARGET_COL,
                         output_dir: str = DEFAULT_OUTPUT_DIR,
-                        output_prefix: str = None) -> dict:
+                        output_prefix: str = None,
+                        id_cols=None,
+                        preserve_all_metadata: bool = True) -> dict:
     """Evaluate one trained model on an external single-fragment dataset."""
     if isinstance(external_data, str):
         df = pd.read_csv(external_data)
@@ -179,8 +184,7 @@ def external_validation(model_info: dict,
         df = external_data.copy()
     else:
         raise TypeError(
-            f"external_data must be a file path (str) or DataFrame, "
-            f"got {type(external_data).__name__}"
+            f"external_data must be a file path (str) or DataFrame, got {type(external_data).__name__}"
         )
 
     unnamed_cols = [col for col in df.columns if 'Unnamed' in str(col)]
@@ -207,21 +211,14 @@ def external_validation(model_info: dict,
     features_missing = [feature for feature in expected_features if feature not in df.columns]
 
     if features_missing:
-        metadata = set(DEFAULT_METADATA_COLUMNS)
-        available = [
-            col for col in df.columns
-            if col not in metadata and col != target_col
-        ]
+        available = [col for col in df.columns if col not in set(expected_features) and col != target_col]
         logger.error(
-            "Missing features in external data: %s\n"
-            "  Expected: %s\n"
-            "  Available: %s",
+            "Missing features in external data: %s\n  Expected: %s\n  Available candidate columns: %s",
             features_missing, expected_features, available
         )
         raise ValueError(
-            f"External data is missing {len(features_missing)} required "
-            f"feature(s): {features_missing}. Ensure the input CSV contains "
-            "all features the model was trained on."
+            f"External data is missing {len(features_missing)} required feature(s): {features_missing}. "
+            "Ensure the input CSV contains all features the model was trained on."
         )
 
     X_external = df[expected_features].copy()
@@ -239,7 +236,14 @@ def external_validation(model_info: dict,
     y_pred_scaled = model.predict(X_scaled)
     y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
 
-    result_cols = _unique_preserving_order(_identifier_columns(df) + expected_features)
+    metadata_cols = _metadata_columns(
+        df,
+        expected_features=expected_features,
+        target_col=target_col,
+        id_cols=id_cols,
+        preserve_all_metadata=preserve_all_metadata,
+    )
+    result_cols = _unique_preserving_order(metadata_cols + expected_features)
     results_df = df[result_cols].copy()
     results_df['predicted_activation_energy'] = y_pred
 
@@ -267,50 +271,36 @@ def external_validation(model_info: dict,
             results_df[target_col] = df[target_col].values
             results_df['absolute_error'] = np.abs(y_pred - df[target_col].values)
             logger.info(
-                "External validation metrics for %s (%d features):\n"
-                "  MAE  = %.4f kcal/mol\n"
-                "  R²   = %.4f\n"
-                "  RMSE = %.4f kcal/mol\n"
-                "  N    = %d",
+                "External validation metrics for %s (%d features): MAE=%.4f, R²=%.4f, RMSE=%.4f, N=%d",
                 model_name, len(expected_features), mae, r2, rmse, len(y_true_eval)
             )
         else:
             logger.warning("No valid ground truth values found — prediction-only mode.")
             has_ground_truth = False
     else:
-        logger.info(
-            "Column '%s' not found in external data — running in prediction-only mode.",
-            target_col
-        )
+        logger.info("Column '%s' not found in external data — running in prediction-only mode.", target_col)
 
     os.makedirs(output_dir, exist_ok=True)
     output_files = []
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     safe_model_name = model_name.replace(' ', '_')
 
-    preds_path = os.path.join(
-        output_dir, f"{safe_model_name}_external_validation_{timestamp}.csv"
-    )
+    preds_path = os.path.join(output_dir, f"{safe_model_name}_external_validation_{timestamp}.csv")
     results_df.to_csv(preds_path, index=False, encoding='utf-8-sig')
     output_files.append(preds_path)
     logger.info("Predictions saved to: %s", preds_path)
 
     if has_ground_truth and mae is not None:
-        plot_path = os.path.join(
-            output_dir, f"{safe_model_name}_external_scatter_{timestamp}.png"
-        )
+        plot_path = os.path.join(output_dir, f"{safe_model_name}_external_scatter_{timestamp}.png")
         _plot_external_scatter(
-            y_true_eval, y_pred_eval, model_name, len(expected_features),
-            mae, r2, rmse, plot_path
+            y_true_eval, y_pred_eval, model_name, len(expected_features), mae, r2, rmse, plot_path
         )
         output_files.append(plot_path)
 
-    summary_path = os.path.join(
-        output_dir, f"{safe_model_name}_external_summary_{timestamp}.txt"
-    )
+    summary_path = os.path.join(output_dir, f"{safe_model_name}_external_summary_{timestamp}.txt")
     _write_external_summary(
-        summary_path, model_name, model_info, len(expected_features),
-        expected_features, features_missing, len(X_external), mae, r2, rmse
+        summary_path, model_name, model_info, len(expected_features), expected_features,
+        features_missing, len(X_external), mae, r2, rmse, metadata_cols
     )
     output_files.append(summary_path)
 
@@ -324,16 +314,15 @@ def external_validation(model_info: dict,
         'features_used': expected_features,
         'features_missing': features_missing,
         'features_present': features_present,
+        'metadata_columns': metadata_cols,
         'output_files': output_files,
     }
 
 
-def _plot_external_scatter(y_true, y_pred, model_name, n_features,
-                           mae, r2, rmse, output_path):
+def _plot_external_scatter(y_true, y_pred, model_name, n_features, mae, r2, rmse, output_path):
     """Create a prediction-vs-experiment scatter plot for external validation."""
     fig, ax = plt.subplots(figsize=(6.0, 6.0))
     ax.scatter(y_true, y_pred, alpha=0.8, edgecolors='black', linewidths=0.5)
-
     y_min = float(min(np.min(y_true), np.min(y_pred)))
     y_max = float(max(np.max(y_true), np.max(y_pred)))
     padding = max((y_max - y_min) * 0.05, 1e-6)
@@ -360,7 +349,7 @@ def _plot_external_scatter(y_true, y_pred, model_name, n_features,
 
 def _write_external_summary(path, model_name, model_info, n_features,
                             features_used, features_missing, n_samples,
-                            mae, r2, rmse):
+                            mae, r2, rmse, metadata_cols=None):
     with open(path, 'w', encoding='utf-8') as f:
         f.write("External Validation Summary\n")
         f.write("===========================\n\n")
@@ -368,6 +357,8 @@ def _write_external_summary(path, model_name, model_info, n_features,
         f.write(f"Checkpoint:  {model_info.get('_loaded_from', 'N/A')}\n")
         f.write(f"Features:    {n_features}\n")
         f.write(f"Feature list: {', '.join(features_used)}\n")
+        if metadata_cols:
+            f.write(f"Metadata columns preserved: {', '.join(metadata_cols)}\n")
         if features_missing:
             f.write(f"Missing:     {', '.join(features_missing)}\n")
         f.write(f"Hyperparameters: {model_info.get('hyperparameters', 'N/A')}\n")
@@ -413,8 +404,7 @@ def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
     features = model_info.get('features')
     if isinstance(features, (str, bytes)) or not isinstance(features, Sequence):
         raise ValueError(
-            f"Invalid checkpoint features schema in {source}: features must "
-            "be a non-string sequence."
+            f"Invalid checkpoint features schema in {source}: features must be a non-string sequence."
         )
 
     invalid_features = [
@@ -423,23 +413,18 @@ def _loaded_feature_count(model_info: dict, filepath: str = None) -> int:
     ]
     if invalid_features:
         raise ValueError(
-            f"Invalid checkpoint features schema in {source}: every feature "
-            f"must be a non-empty string; invalid values={invalid_features!r}."
+            f"Invalid checkpoint features schema in {source}: every feature must be a non-empty string; "
+            f"invalid values={invalid_features!r}."
         )
     if len(set(features)) != len(features):
         raise ValueError(
-            f"Invalid checkpoint features schema in {source}: feature names "
-            "must be unique."
+            f"Invalid checkpoint features schema in {source}: feature names must be unique."
         )
 
     actual_count = len(features)
     metadata_count = model_info.get('optimal_n_features')
-    metadata_is_valid = (
-        isinstance(metadata_count, Integral) and not isinstance(metadata_count, bool)
-    )
-    if metadata_count is not None and (
-        not metadata_is_valid or int(metadata_count) != actual_count
-    ):
+    metadata_is_valid = isinstance(metadata_count, Integral) and not isinstance(metadata_count, bool)
+    if metadata_count is not None and (not metadata_is_valid or int(metadata_count) != actual_count):
         raise ValueError(
             f"Invalid or inconsistent checkpoint feature metadata in {source}: "
             f"optimal_n_features={metadata_count!r}, len(features)={actual_count}."
@@ -475,61 +460,35 @@ def _checkpoint_priority(checkpoint: dict) -> int:
     return 0 if checkpoint['checkpoint_type'] == 'final' else 1
 
 
-def _sort_checkpoints_for_selection(checkpoints: list[dict]) -> list[dict]:
-    return sorted(
-        checkpoints,
-        key=lambda item: (
-            _checkpoint_priority(item),
-            item['timestamp'],
-            os.path.basename(item['path']),
-        ),
-        reverse=False,
-    )
-
-
 def _best_checkpoint(checkpoints: list[dict]) -> dict:
     if not checkpoints:
         raise FileNotFoundError("No final or iteration checkpoints found")
-
     top_priority = min(_checkpoint_priority(item) for item in checkpoints)
-    priority_candidates = [
-        item for item in checkpoints if _checkpoint_priority(item) == top_priority
-    ]
+    priority_candidates = [item for item in checkpoints if _checkpoint_priority(item) == top_priority]
     latest_timestamp = max(item['timestamp'] for item in priority_candidates)
-    latest_candidates = [
-        item for item in priority_candidates if item['timestamp'] == latest_timestamp
-    ]
+    latest_candidates = [item for item in priority_candidates if item['timestamp'] == latest_timestamp]
     if len(latest_candidates) > 1:
         names = [os.path.basename(item['path']) for item in latest_candidates]
         raise ValueError(f"Ambiguous checkpoint candidates: {names}")
     return latest_candidates[0]
 
 
-def _select_checkpoint(checkpoints: list[dict], n_features: int = None,
-                       allow_closest: bool = False) -> dict:
+def _select_checkpoint(checkpoints: list[dict], n_features: int = None, allow_closest: bool = False) -> dict:
     if not checkpoints:
         raise FileNotFoundError("No final or iteration checkpoints found")
-
     if n_features is None:
         return _best_checkpoint(checkpoints)
-
     exact = [item for item in checkpoints if item['actual_n_features'] == n_features]
     if exact:
         return _best_checkpoint(exact)
-
     available_counts = sorted({item['actual_n_features'] for item in checkpoints})
     if not allow_closest:
         raise ValueError(
-            f"No checkpoint with exactly {n_features} features. "
-            f"Available feature counts: {available_counts}"
+            f"No checkpoint with exactly {n_features} features. Available feature counts: {available_counts}"
         )
-
     nearest_distance = min(abs(count - n_features) for count in available_counts)
-    nearest_counts = [
-        count for count in available_counts if abs(count - n_features) == nearest_distance
-    ]
-    candidate_counts = set(nearest_counts)
-    nearest = [item for item in checkpoints if item['actual_n_features'] in candidate_counts]
+    nearest_counts = [count for count in available_counts if abs(count - n_features) == nearest_distance]
+    nearest = [item for item in checkpoints if item['actual_n_features'] in set(nearest_counts)]
     return _best_checkpoint(nearest)
 
 
@@ -540,22 +499,17 @@ def load_model(model_name: str, n_features: int = None,
     model_dir = os.path.join(models_dir, model_name)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
-
     checkpoints = _discover_model_checkpoints(model_dir)
     if not checkpoints:
         raise FileNotFoundError(
             f"No final or iteration checkpoints found for {model_name} in {model_dir}"
         )
-
     selected = _select_checkpoint(checkpoints, n_features=n_features, allow_closest=allow_closest)
     info = selected['model_info']
     required_keys = ['model', 'scaler_X', 'scaler_y', 'features']
     missing = [key for key in required_keys if key not in info]
     if missing:
-        raise ValueError(
-            f"Checkpoint {selected['path']} is missing required key(s): {missing}"
-        )
-
+        raise ValueError(f"Checkpoint {selected['path']} is missing required key(s): {missing}")
     loaded = dict(info)
     loaded['_loaded_from'] = selected['path']
     loaded['_checkpoint_type'] = selected['checkpoint_type']
@@ -596,15 +550,16 @@ def ensemble_validation(ensemble_csv: str,
                         target_col: str = DEFAULT_TARGET_COL,
                         output_dir: str = DEFAULT_OUTPUT_DIR,
                         models_dir: str = DEFAULT_MODELS_DIR,
-                        allow_closest: bool = False) -> dict:
+                        allow_closest: bool = False,
+                        id_cols=None,
+                        preserve_all_metadata: bool = True) -> dict:
     """Run CSV-driven ensemble external validation."""
     spec = pd.read_csv(ensemble_csv)
     required_columns = {'model_name', 'n_features'}
     missing_spec = required_columns - set(spec.columns)
     if missing_spec:
         raise ValueError(
-            f"Ensemble CSV must contain columns {sorted(required_columns)}; "
-            f"missing {sorted(missing_spec)}"
+            f"Ensemble CSV must contain columns {sorted(required_columns)}; missing {sorted(missing_spec)}"
         )
 
     if isinstance(external_data, str):
@@ -613,8 +568,7 @@ def ensemble_validation(ensemble_csv: str,
         df_external = external_data.copy()
     else:
         raise TypeError(
-            f"external_data must be a file path (str) or DataFrame, "
-            f"got {type(external_data).__name__}"
+            f"external_data must be a file path (str) or DataFrame, got {type(external_data).__name__}"
         )
 
     unnamed_cols = [col for col in df_external.columns if 'Unnamed' in str(col)]
@@ -636,6 +590,7 @@ def ensemble_validation(ensemble_csv: str,
     ensemble_members = []
     ensemble_errors = []
     resolved_checkpoints = {}
+    all_expected_features = set()
 
     for spec_position, (_, row) in enumerate(spec.iterrows(), start=1):
         model_name = row['model_name']
@@ -654,9 +609,7 @@ def ensemble_validation(ensemble_csv: str,
             ensemble_errors.append((model_name, requested_n_features, str(exc)))
             continue
 
-        loaded_from = os.path.normcase(
-            os.path.realpath(os.path.abspath(model_info['_loaded_from']))
-        )
+        loaded_from = os.path.normcase(os.path.realpath(os.path.abspath(model_info['_loaded_from'])))
         if loaded_from in resolved_checkpoints:
             first_label = resolved_checkpoints[loaded_from]
             error = (
@@ -672,6 +625,7 @@ def ensemble_validation(ensemble_csv: str,
         scaler_X = model_info['scaler_X']
         scaler_y = model_info['scaler_y']
         expected_features = list(model_info['features'])
+        all_expected_features.update(expected_features)
         actual_n_features = model_info['_actual_n_features']
         label = f"{model_name} ({actual_n_features} feat)"
         member_id = f"member_{spec_position}"
@@ -679,9 +633,7 @@ def ensemble_validation(ensemble_csv: str,
         missing = [feature for feature in expected_features if feature not in df_external.columns]
         if missing:
             logger.warning("Skipping %s - missing features: %s", label, missing)
-            ensemble_errors.append(
-                (model_name, requested_n_features, f"Missing features: {missing}")
-            )
+            ensemble_errors.append((model_name, requested_n_features, f"Missing features: {missing}"))
             continue
 
         try:
@@ -690,8 +642,7 @@ def ensemble_validation(ensemble_csv: str,
                 member_weight = float(1.0 / (rkf_mae ** 2))
             if not np.isfinite(member_weight) or member_weight <= 0:
                 raise ValueError(
-                    f"Internal-CV MAE {rkf_mae!r} produces a non-finite "
-                    "or non-positive ensemble weight."
+                    f"Internal-CV MAE {rkf_mae!r} produces a non-finite or non-positive ensemble weight."
                 )
         except ValueError as exc:
             logger.warning("Skipping %s: %s", label, exc)
@@ -755,10 +706,16 @@ def ensemble_validation(ensemble_csv: str,
     y_pred_weighted = prediction_frame.dot(weight_array)
     excluded_rows = len(df_external) - len(prediction_frame)
 
-    id_cols = _identifier_columns(df_external)
+    metadata_cols = _metadata_columns(
+        df_external,
+        expected_features=all_expected_features,
+        target_col=target_col,
+        id_cols=id_cols,
+        preserve_all_metadata=preserve_all_metadata,
+    )
     results_df = df_external.loc[
         prediction_frame.index,
-        _unique_preserving_order([original_index_col] + id_cols),
+        _unique_preserving_order([original_index_col] + metadata_cols),
     ].copy()
 
     used_prediction_columns = set()
@@ -788,7 +745,6 @@ def ensemble_validation(ensemble_csv: str,
             rmse = float(np.sqrt(mean_squared_error(y_true_valid, y_pred_weighted_valid)))
             results_df[target_col] = y_true
             results_df['absolute_error_weighted'] = np.abs(y_pred_weighted - y_true)
-
             for result in individual_results:
                 if result['member_id'] not in prediction_frame.columns:
                     continue
@@ -811,8 +767,7 @@ def ensemble_validation(ensemble_csv: str,
     if has_gt and mae is not None:
         plot_path = os.path.join(output_dir, f'ensemble_scatter_{timestamp}.png')
         _plot_external_scatter(
-            y_true_valid, y_pred_weighted_valid, 'Ensemble', len(member_ids),
-            mae, r2, rmse, plot_path
+            y_true_valid, y_pred_weighted_valid, 'Ensemble', len(member_ids), mae, r2, rmse, plot_path
         )
         output_files.append(plot_path)
 
@@ -833,6 +788,7 @@ def ensemble_validation(ensemble_csv: str,
         'ensemble_members': ensemble_members,
         'individual_results': individual_results,
         'ensemble_errors': ensemble_errors,
+        'metadata_columns': metadata_cols,
         'output_files': output_files,
     }
 
@@ -860,8 +816,7 @@ def _write_ensemble_summary(path, ensemble_members, individual_results, ensemble
             f.write("\n--- Individual Results ---\n")
             for result in individual_results:
                 f.write(
-                    f"{result['label']}: weight={result['weight']:.6f}, "
-                    f"MAE={result['mae']}\n"
+                    f"{result['label']}: weight={result['weight']:.6f}, MAE={result['mae']}\n"
                 )
         if ensemble_errors:
             f.write("\n--- Skipped Members ---\n")
@@ -874,23 +829,6 @@ def main():
     parser = argparse.ArgumentParser(
         description='External Validation for Organoboronate ML Models',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # List all available trained models
-  python src/external_validation.py --list-models
-
-  # Validate SVR model on external data
-  python src/external_validation.py --model SVR --data my_external_data.csv
-
-  # Validate RandomForest with 5 features
-  python src/external_validation.py --model RandomForest --n_features 5 --data external.csv
-
-  # Prediction-only (no ground truth column)
-  python src/external_validation.py --model SVR --data new_compounds.csv --predict-only
-
-  # Ensemble external validation (CSV-driven, multiple models)
-  python src/external_validation.py --ensemble ensemble_spec.csv --data external.csv
-        """
     )
     parser.add_argument('--list-models', action='store_true')
     parser.add_argument('--model', type=str, default=None)
@@ -902,6 +840,17 @@ Examples:
     parser.add_argument('--ensemble', type=str, default=None)
     parser.add_argument('--allow-closest', action='store_true')
     parser.add_argument('--models-dir', type=str, default=DEFAULT_MODELS_DIR)
+    parser.add_argument(
+        '--id-cols',
+        type=str,
+        default=None,
+        help='Comma-separated metadata columns to prioritize in output CSVs. Defaults to ID,SMILES,filename.',
+    )
+    parser.add_argument(
+        '--only-id-cols',
+        action='store_true',
+        help='Only preserve prioritized --id-cols metadata instead of all non-feature metadata.',
+    )
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -919,6 +868,7 @@ Examples:
         parser.error('--data is required unless --list-models is used')
 
     target_col = None if args.predict_only else args.target_col
+    preserve_all_metadata = not args.only_id_cols
 
     if args.ensemble:
         results = ensemble_validation(
@@ -928,6 +878,8 @@ Examples:
             output_dir=args.output_dir,
             models_dir=args.models_dir,
             allow_closest=args.allow_closest,
+            id_cols=args.id_cols,
+            preserve_all_metadata=preserve_all_metadata,
         )
         print(f"\n{'=' * 60}")
         print("  Ensemble External Validation Complete")
@@ -939,16 +891,12 @@ Examples:
             print(f"  MAE:         {results['mae']:.4f} kcal/mol")
             print(f"  R2:          {results['r2']:.4f}")
             print(f"  RMSE:        {results['rmse']:.4f} kcal/mol")
-        else:
-            print("  Mode:        Prediction-only")
-        print("\n  Output files:")
-        for fp in results['output_files']:
-            print(f"    - {fp}")
-        print(f"{'=' * 60}\n")
+        for path in results['output_files']:
+            print(f"  - {path}")
         return results
 
     if args.model is None:
-        parser.error('--model is required for single-model validation')
+        parser.error('--model is required unless --list-models or --ensemble is used')
 
     model_info = load_model(
         args.model,
@@ -962,13 +910,15 @@ Examples:
         target_col=target_col,
         output_dir=args.output_dir,
         output_prefix=args.model,
+        id_cols=args.id_cols,
+        preserve_all_metadata=preserve_all_metadata,
     )
 
     print(f"\n{'=' * 60}")
     print("  External Validation Complete")
     print(f"{'=' * 60}")
     print(f"  Model:       {args.model}")
-    print(f"  Features:    {results['n_features_used']} ({', '.join(results['features_used'])})")
+    print(f"  Features:    {results['n_features_used']}")
     print(f"  Samples:     {results['n_samples']}")
     if results['mae'] is not None:
         print(f"  MAE:         {results['mae']:.4f} kcal/mol")
@@ -977,8 +927,8 @@ Examples:
     else:
         print("  Mode:        Prediction-only")
     print("\n  Output files:")
-    for fp in results['output_files']:
-        print(f"    - {fp}")
+    for path in results['output_files']:
+        print(f"  - {path}")
     print(f"{'=' * 60}\n")
     return results
 
