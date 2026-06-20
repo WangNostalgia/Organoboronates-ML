@@ -21,6 +21,8 @@ DEFAULT_MODEL_NAMES = (
     "CatBoost",
     "GPlearn",
 )
+METADATA_COLUMNS = ("ID", "SMILES", "filename")
+TARGET_COL = "activation_energy"
 
 
 def positive_int(value):
@@ -169,10 +171,22 @@ def build_argument_parser():
         description="Machine learning model training and evaluation"
     )
     parser.add_argument(
-        "--n_jobs",
+        "--model_jobs",
         type=int,
         default=-1,
-        help="Number of CPU cores to use (-1 means using all cores)",
+        help="Estimator-internal CPU parallelism (-1 means using all cores when supported)",
+    )
+    parser.add_argument(
+        "--optuna_jobs",
+        type=positive_int,
+        default=1,
+        help="Number of Optuna trials to run in parallel. Default 1 for reproducible, stable TPE.",
+    )
+    parser.add_argument(
+        "--n_jobs",
+        type=int,
+        default=None,
+        help="Deprecated alias for --model_jobs.",
     )
     parser.add_argument(
         "--n_trials",
@@ -204,9 +218,36 @@ def build_argument_parser():
     return parser
 
 
+def _select_feature_columns(data):
+    import numpy as np
+
+    if TARGET_COL not in data.columns:
+        raise ValueError(f"Missing target column: {TARGET_COL}")
+    metadata = set(METADATA_COLUMNS)
+    numeric_columns = data.select_dtypes(include=[np.number]).columns
+    return [
+        column for column in numeric_columns
+        if column != TARGET_COL and column not in metadata
+    ]
+
+
+def _set_optuna_runtime_default(optuna_jobs):
+    # iterative_optimization imports the function object directly. Mutating the
+    # default keeps this CLI wiring minimal without changing unrelated pipeline
+    # signatures in this focused fix.
+    import src.hyperparameter_optimization_and_training as hot
+
+    defaults = list(hot.hyperparameter_optimization_and_training.__defaults__)
+    defaults[-1] = int(optuna_jobs)
+    hot.hyperparameter_optimization_and_training.__defaults__ = tuple(defaults)
+
+
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
+
+    if args.n_jobs is not None:
+        args.model_jobs = args.n_jobs
 
     if args.force_n_features is not None and "GPlearn" in DEFAULT_MODEL_NAMES:
         parser.error(
@@ -217,17 +258,19 @@ def main():
         )
 
     configure_runtime()
+    _set_optuna_runtime_default(args.optuna_jobs)
 
-    import numpy as np
     import pandas as pd
 
     from src.iterative_optimization import iterative_optimization
 
     data = pd.read_csv("example/B_dataset.csv")
     data = data.dropna(axis=1, how="all")
-    features = data.select_dtypes(include=[np.number]).columns
-    X = data[features].drop("activation_energy", axis=1)
-    y = data["activation_energy"]
+    feature_columns = _select_feature_columns(data)
+    if not feature_columns:
+        raise ValueError("No numeric descriptor feature columns found.")
+    X = data[feature_columns]
+    y = data[TARGET_COL]
 
     # Evaluate baseline model
     # baseline = Baseline()
@@ -236,16 +279,6 @@ def main():
     # Per-model minimum feature limits (optional).
     # Set to None to use the unified `--min_features` CLI argument for all models.
     # Uncomment and modify the dict below to override per model.
-    #
-    # NOTE: All feature removal is now driven by SHAP-RFECV. When features < 10,
-    # CV metrics are recorded along the removal path, and after the loop the
-    # optimal feature count is AUTO-SELECTED (minimum RKfold MAE on the path).
-    # `--min_features` / `custom_min_features` sets the FLOOR — the loop stops
-    # when this many features remain. Set it low (2–3) to let auto-selection
-    # explore the full path, or higher (7–8) to constrain the search.
-    #
-    # Ridge and Lasso use explicit fold-local alpha search on development data.
-    # SVR epsilon is searched in 0.001–0.5, gamma in 0.1–10 (RBF kernel).
     custom_model_min_features = None
     # custom_model_min_features = {
     #     "LinearRegression": 2,
@@ -265,7 +298,7 @@ def main():
         X,
         y,
         n_trials=args.n_trials,
-        n_jobs=args.n_jobs,
+        n_jobs=args.model_jobs,
         keep_versions=args.keep_versions,
         min_features=args.min_features,
         custom_min_features=custom_model_min_features,
