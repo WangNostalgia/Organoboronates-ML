@@ -4,19 +4,18 @@
   Manual Feature-Count Selection & Plotting (Standalone)
 ===============================================================================
 
-After training completes, inspect each model's SHAP-RFECV Path Summary
-(printed in the console log or saved in *_final_*_metrics.txt), decide the
-best feature count manually, and use this script to:
+After training completes, inspect each model's SHAP-RFECV path summary, decide
+manual per-model feature counts using development-only evidence, and use this
+script to create strict manual-final artifacts.
 
-  1. Read a CSV specifying per-model manual feature counts
-  2. Load the corresponding iteration checkpoint for that feature count
-  3. Generate final_scatter and final_scatter_outliers for each model
-  4. (Future) Predict on external data — commented out for now
-
-Usage:
-    1. Create a CSV file (e.g. 'manual_feature_selection.csv') with columns:
-       model_name, n_features
-    2. Run: python example/manual_selection_and_plot.py
+This script now mirrors the main.py finalization protocol:
+  1. Read manual_feature_selection.csv with columns: model_name,n_features
+  2. Exactly load the iteration checkpoint with the requested feature count
+  3. Refuse missing feature-count matches instead of falling back to closest
+  4. Read evaluation_protocol development_indices/final_test_indices
+  5. Refit selected features + complete_params on the development rows
+  6. Evaluate the final-test rows exactly once
+  7. Save a manual-final checkpoint, metrics txt, and final scatter plot
 
 The CSV format:
     model_name,n_features
@@ -24,43 +23,52 @@ The CSV format:
     RandomForest,7
     XGBoost,4
     ...
+
+Important:
+    Do not choose manual n_features after inspecting final-test plots. Manual
+    selection should be based on development-only metrics, path stability, and
+    chemical interpretability so that the final test remains untouched.
 ===============================================================================
 """
 
-import joblib
+from __future__ import annotations
+
 import glob
 import os
+import re
 import sys
-import pandas as pd
+from datetime import datetime
+from pathlib import Path
+
+import joblib
 import numpy as np
+import pandas as pd
+from sklearn.base import clone
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
 
 # Add project root to path so we can import src modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.visualization import plot_scatter
-from sklearn.model_selection import train_test_split
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Configuration — EDIT THESE                                           ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-# Path to the CSV specifying manual feature counts per model
 MANUAL_SELECTION_CSV = os.path.join(os.path.dirname(__file__), 'manual_feature_selection.csv')
-
-# Path to the training data (same as used in main.py)
 DATA_PATH = 'example/B_dataset.csv'
-
-# Output directory for plots
 OUTPUT_DIR = 'models/manual_selection_plots'
-
-# Target column name
 TARGET_COL = 'activation_energy'
+MODELS_DIR = 'models'
+MODEL_JOBS = -1
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Core logic                                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+
 
 def load_manual_selections(csv_path):
     """
@@ -73,7 +81,8 @@ def load_manual_selections(csv_path):
 
     Returns
     -------
-    dict: {model_name: n_features}
+    dict
+        {model_name: n_features}
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
@@ -88,147 +97,371 @@ def load_manual_selections(csv_path):
     df.columns = df.columns.str.strip().str.lower()
     if 'model_name' not in df.columns or 'n_features' not in df.columns:
         raise ValueError("CSV must have columns: model_name, n_features")
+
     selections = {}
     for _, row in df.iterrows():
-        selections[str(row['model_name']).strip()] = int(row['n_features'])
+        model_name = str(row['model_name']).strip()
+        n_features = int(row['n_features'])
+        if not model_name:
+            raise ValueError("model_name values must be non-empty")
+        if n_features < 1:
+            raise ValueError(f"n_features must be positive for {model_name}")
+        selections[model_name] = n_features
+
     print(f"Loaded {len(selections)} manual selections from {csv_path}")
     for name, n in selections.items():
         print(f"  {name}: {n} features")
     return selections
 
 
+def _checkpoint_timestamp(filepath):
+    match = re.search(r"_iteration_\d+_(\d{8}_\d{6})\.joblib$", os.path.basename(filepath))
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def _internal_cv_mae(checkpoint_info):
+    metrics = checkpoint_info.get('metrics', {})
+    internal_cv = metrics.get('internal_cv', {})
+    value = internal_cv.get('rkf_mae_mean')
+    if value is None:
+        value = metrics.get('rkf_mae_mean')
+    if value is None:
+        value = metrics.get('mae_mean', float('inf'))
+    return float(value)
+
+
 def find_checkpoint(model_name, n_features):
     """
-    Find the iteration checkpoint for a given model and feature count.
+    Exactly find the iteration checkpoint for a model and feature count.
 
-    Searches models/<model_name>/*_iteration_*.joblib for the checkpoint
-    whose feature set has exactly n_features and has the lowest MAE among
-    all matches.
-
-    Parameters
-    ----------
-    model_name : str, e.g. 'SVR'
-    n_features : int, desired feature count
-
-    Returns
-    -------
-    info : dict from joblib.load()
-    source_file : str, path to the checkpoint file
+    No closest fallback is allowed. If multiple exact checkpoints exist from
+    different runs, choose the newest timestamp; if the newest timestamp is
+    ambiguous, raise an error instead of silently cherry-picking by final-test
+    performance.
     """
-    model_dir = os.path.join('models', model_name)
+    model_dir = os.path.join(MODELS_DIR, model_name)
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
     pattern = os.path.join(model_dir, '*_iteration_*.joblib')
+    available_counts = []
     candidates = []
     for filepath in glob.glob(pattern):
         info = joblib.load(filepath)
-        if len(info['features']) == n_features:
-            mae = info['metrics'].get('mae_mean', float('inf'))
-            candidates.append((mae, filepath, info))
+        feature_count = len(info['features'])
+        available_counts.append(feature_count)
+        if feature_count == n_features:
+            candidates.append((_checkpoint_timestamp(filepath), filepath, info))
 
     if not candidates:
-        # Closest available
-        all_entries = []
-        for filepath in glob.glob(pattern):
-            info = joblib.load(filepath)
-            all_entries.append((abs(len(info['features']) - n_features),
-                                info['metrics'].get('mae_mean', float('inf')),
-                                filepath, info))
-        all_entries.sort()
-        _, _, closest_file, closest_info = all_entries[0]
-        actual_n = len(closest_info['features'])
-        print(f"  WARNING: {model_name}: no checkpoint with {n_features} features. "
-              f"Using closest: {actual_n} features (file: {os.path.basename(closest_file)})")
-        return closest_info, closest_file
+        available = sorted(set(available_counts))
+        raise FileNotFoundError(
+            f"{model_name}: no iteration checkpoint with exactly {n_features} features. "
+            f"Available feature counts: {available}. Re-run main.py if the requested "
+            "feature count is not on the evaluated SHAP-RFECV path."
+        )
 
-    candidates.sort(key=lambda x: x[0])
-    best_mae, best_file, best_info = candidates[0]
-    print(f"  {model_name}: loaded {n_features}-feature checkpoint "
-          f"(MAE_mean={best_mae:.4f}, file: {os.path.basename(best_file)})")
-    return best_info, best_file
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    newest_timestamp = candidates[0][0]
+    newest = [item for item in candidates if item[0] == newest_timestamp]
+    if len(newest) > 1:
+        names = [os.path.basename(item[1]) for item in newest]
+        raise ValueError(
+            f"{model_name}: ambiguous exact {n_features}-feature checkpoints with "
+            f"timestamp {newest_timestamp}: {names}"
+        )
+
+    timestamp, source_file, info = newest[0]
+    print(
+        f"  {model_name}: loaded exact {n_features}-feature checkpoint "
+        f"(internal_cv_mae={_internal_cv_mae(info):.4f}, file: {os.path.basename(source_file)})"
+    )
+    return info, source_file
 
 
-def generate_plots(model_name, checkpoint_info):
-    """
-    Generate final_scatter and final_scatter_outliers for a manually
-    selected model, matching the output of iterative_optimization.py.
+def _require_protocol_indices(checkpoint_info, source_file):
+    protocol = checkpoint_info.get('evaluation_protocol') or {}
+    development_indices = protocol.get('development_indices')
+    final_test_indices = protocol.get('final_test_indices')
 
-    Parameters
-    ----------
-    model_name : str, e.g. 'SVR'
-    checkpoint_info : dict from joblib.load()
-    """
-    model = checkpoint_info['model']
-    features = checkpoint_info['features']
-    best_params = checkpoint_info['hyperparameters']
+    if not development_indices or not final_test_indices:
+        raise ValueError(
+            f"Checkpoint {source_file} does not contain both "
+            "evaluation_protocol['development_indices'] and "
+            "evaluation_protocol['final_test_indices']. Re-run main.py to create "
+            "protocol-aware iteration checkpoints."
+        )
+    return protocol, list(development_indices), list(final_test_indices)
 
-    # Load the training data and subset to the selected features
-    data = pd.read_csv(DATA_PATH).dropna(axis=1, how='all')
-    X = data[features]
-    y = data[TARGET_COL]
 
-    # Train/test split (MUST match iterative_optimization.py which uses random_state=40)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=40
+def _split_data_by_checkpoint_protocol(data, checkpoint_info, source_file, features):
+    protocol, development_indices, final_test_indices = _require_protocol_indices(
+        checkpoint_info,
+        source_file,
     )
 
-    # Scale and fit (fresh scalers on this split)
-    from sklearn.preprocessing import MinMaxScaler
-    sX = MinMaxScaler()
-    sY = MinMaxScaler(feature_range=(0, 100))
-    X_train_s = sX.fit_transform(X_train)
-    X_test_s = sX.transform(X_test)
-    y_train_s = sY.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+    missing_dev = [idx for idx in development_indices if idx not in data.index]
+    missing_test = [idx for idx in final_test_indices if idx not in data.index]
+    if missing_dev or missing_test:
+        raise ValueError(
+            f"Checkpoint split indices do not match {DATA_PATH}. "
+            f"Missing development labels: {missing_dev[:10]}; "
+            f"missing final-test labels: {missing_test[:10]}. Use the same, "
+            "unreordered source CSV used by main.py."
+        )
 
-    model.fit(X_train_s, y_train_s)
-    y_pred_train_s = model.predict(X_train_s)
-    y_pred_test_s = model.predict(X_test_s)
-    y_pred_train = sY.inverse_transform(y_pred_train_s.reshape(-1, 1)).ravel()
-    y_pred_test = sY.inverse_transform(y_pred_test_s.reshape(-1, 1)).ravel()
+    missing_features = [feature for feature in features if feature not in data.columns]
+    if missing_features:
+        raise ValueError(f"Training data missing selected features: {missing_features}")
+    if TARGET_COL not in data.columns:
+        raise ValueError(f"Training data missing target column: {TARGET_COL}")
 
-    # Use the checkpoint's stored metrics (computed during the original
-    # training iteration with the correct feature set).
-    stored_metrics = checkpoint_info.get('metrics', {})
-    mae_mean = stored_metrics.get('mae_mean')     # 100-split average MAE
-    rkf_mae = stored_metrics.get('rkf_mae_mean')   # 5×5 RepeatedKFold MAE
-    rkf_r2 = stored_metrics.get('rkf_r2_mean')     # 5×5 RepeatedKFold R²
+    X_development = data.loc[development_indices, features].copy()
+    y_development = data.loc[development_indices, TARGET_COL].copy()
+    X_final_test = data.loc[final_test_indices, features].copy()
+    y_final_test = data.loc[final_test_indices, TARGET_COL].copy()
+    return protocol, X_development, y_development, X_final_test, y_final_test
 
-    # Output directories
-    out_dir = os.path.join(OUTPUT_DIR, model_name)
-    os.makedirs(out_dir, exist_ok=True)
 
-    # Generate plot (same signature as iterative_optimization.py)
-    n_feat = len(features)
+def _make_estimator_from_checkpoint(checkpoint_info):
+    estimator_template = checkpoint_info.get('estimator', checkpoint_info.get('model'))
+    if estimator_template is None:
+        raise ValueError("Checkpoint missing both 'estimator' and 'model'.")
+
+    estimator = clone(estimator_template)
+    complete_params = dict(
+        checkpoint_info.get('complete_params')
+        or checkpoint_info.get('hyperparameters')
+        or estimator.get_params()
+    )
+    try:
+        estimator.set_params(**complete_params)
+    except ValueError as exc:
+        raise ValueError(
+            "Could not apply checkpoint complete_params to the estimator. "
+            "This manual-final flow requires a checkpoint with a reproducible "
+            "complete estimator configuration."
+        ) from exc
+    return estimator, complete_params
+
+
+def _fit_and_predict(estimator, X_development, y_development, X_final_test):
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler(feature_range=(0, 100))
+    X_development_scaled = scaler_X.fit_transform(X_development)
+    X_final_test_scaled = scaler_X.transform(X_final_test)
+    y_development_scaled = scaler_y.fit_transform(
+        np.asarray(y_development).reshape(-1, 1)
+    ).ravel()
+
+    fitted_estimator = clone(estimator)
+    fitted_estimator.fit(X_development_scaled, y_development_scaled)
+
+    y_pred_dev_scaled = np.asarray(fitted_estimator.predict(X_development_scaled)).reshape(-1, 1)
+    y_pred_test_scaled = np.asarray(fitted_estimator.predict(X_final_test_scaled)).reshape(-1, 1)
+    y_pred_development = scaler_y.inverse_transform(y_pred_dev_scaled).ravel()
+    y_pred_final_test = scaler_y.inverse_transform(y_pred_test_scaled).ravel()
+    return fitted_estimator, scaler_X, scaler_y, y_pred_development, y_pred_final_test
+
+
+def _pearson_r(y_true, y_pred):
+    if len(y_true) > 1:
+        return float(np.corrcoef(y_true, y_pred)[0, 1])
+    return 0.0
+
+
+def _scatter_metrics(y_development, y_pred_development, y_final_test, y_pred_final_test):
+    return {
+        'r_train': _pearson_r(y_development, y_pred_development),
+        'r_test': _pearson_r(y_final_test, y_pred_final_test),
+        'r2_train': float(r2_score(y_development, y_pred_development)),
+        'rmse_test': float(np.sqrt(mean_squared_error(y_final_test, y_pred_final_test))),
+        'r2_test': float(r2_score(y_final_test, y_pred_final_test)),
+        'mae_test': float(mean_absolute_error(y_final_test, y_pred_final_test)),
+    }
+
+
+def _secondary_metrics(checkpoint_info):
+    metrics = checkpoint_info.get('metrics', {})
+    internal_cv = metrics.get('internal_cv', {})
+    stability = metrics.get('stability', {})
+    loo = metrics.get('loo', {})
+    return {
+        'development_cv_mae': metrics.get('development_cv_mae'),
+        'internal_cv': internal_cv,
+        'stability': stability,
+        'loo': loo,
+        'mae_mean': metrics.get('mae_mean'),
+        'rkf_mae_mean': internal_cv.get('rkf_mae_mean', metrics.get('rkf_mae_mean')),
+        'rkf_r2_mean': internal_cv.get('rkf_r2_mean', metrics.get('rkf_r2_mean')),
+        'loo_r2': loo.get('r2', metrics.get('loo_r2')),
+    }
+
+
+def _write_metrics_txt(path, model_name, n_features, features, complete_params,
+                       source_file, protocol, metrics, secondary):
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(f"Model: {model_name}\n")
+        handle.write("Selection mode: manual feature-count selection\n")
+        handle.write(f"Manual feature count: {n_features}\n")
+        handle.write(f"Features ({n_features}): {', '.join(features)}\n")
+        handle.write(f"Source iteration checkpoint: {source_file}\n")
+        handle.write("\n--- Evaluation Protocol ---\n")
+        handle.write("Split source: checkpoint evaluation_protocol indices\n")
+        handle.write(f"Protocol name: {protocol.get('name', 'N/A')}\n")
+        handle.write(f"Random state: {protocol.get('random_state', 'N/A')}\n")
+        handle.write(f"Test size: {protocol.get('test_size', 'N/A')}\n")
+        handle.write(f"Development rows: {len(protocol.get('development_indices', []))}\n")
+        handle.write(f"Final-test rows: {len(protocol.get('final_test_indices', []))}\n")
+        handle.write("Final-test evaluations in this manual-final artifact: 1\n")
+        handle.write("\n--- PRIMARY: Untouched Final Test ---\n")
+        handle.write(f"Final Test MAE: {metrics['mae_test']:.4f} kcal/mol\n")
+        handle.write(f"Final Test R²:  {metrics['r2_test']:.4f}\n")
+        handle.write(f"Final Test RMSE: {metrics['rmse_test']:.4f} kcal/mol\n")
+        handle.write(f"Final Test Pearson R: {metrics['r_test']:.4f}\n")
+        handle.write("\n--- SECONDARY: Development-Only Metrics from Source Checkpoint ---\n")
+        if secondary.get('rkf_mae_mean') is not None:
+            handle.write(f"Internal CV MAE: {secondary['rkf_mae_mean']:.4f}\n")
+        if secondary.get('rkf_r2_mean') is not None:
+            handle.write(f"Internal CV R²:  {secondary['rkf_r2_mean']:.4f}\n")
+        if secondary.get('mae_mean') is not None:
+            handle.write(f"Stability MAE:   {secondary['mae_mean']:.4f}\n")
+        if secondary.get('loo_r2') is not None:
+            handle.write(f"LOOCV R²:        {secondary['loo_r2']:.4f}\n")
+        handle.write("\nComplete Parameters:\n")
+        handle.write(f"{complete_params}\n")
+
+
+def generate_manual_final_artifacts(model_name, n_features, checkpoint_info, source_file):
+    """
+    Generate a strict manual-final checkpoint, metrics txt, and scatter plot.
+    """
+    features = list(checkpoint_info['features'])
+    if len(features) != n_features:
+        raise ValueError(
+            f"Loaded checkpoint feature count {len(features)} does not match requested {n_features}."
+        )
+
+    data = pd.read_csv(DATA_PATH).dropna(axis=1, how='all')
+    protocol, X_dev, y_dev, X_test, y_test = _split_data_by_checkpoint_protocol(
+        data,
+        checkpoint_info,
+        source_file,
+        features,
+    )
+    estimator, complete_params = _make_estimator_from_checkpoint(checkpoint_info)
+    fitted_estimator, scaler_X, scaler_y, y_pred_dev, y_pred_test = _fit_and_predict(
+        estimator,
+        X_dev,
+        y_dev,
+        X_test,
+    )
+    metrics = _scatter_metrics(y_dev, y_pred_dev, y_test, y_pred_test)
+    secondary = _secondary_metrics(checkpoint_info)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_dir = os.path.join(MODELS_DIR, model_name)
+    plot_dir = os.path.join(OUTPUT_DIR, model_name)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    safe_model_label = f"{model_name} ({n_features} feat; manual feature-count selection)"
+    scatter_name = f"manual_final_scatter_{n_features}feat_{timestamp}.png"
     plot_scatter(
-        y_train=y_train,
-        y_pred_train=y_pred_train,
+        y_train=y_dev,
+        y_pred_train=y_pred_dev,
         y_test=y_test,
         y_pred_test=y_pred_test,
-        model_name=f"{model_name} ({n_feat} feat)",
-        mae_mean=mae_mean,
-        output_dir=out_dir + '/',
-        output_name=f'final_scatter_{n_feat}feat.png',
-        X_train=X_train,
+        model_name=safe_model_label,
+        mae_mean=secondary.get('mae_mean'),
+        output_dir=plot_dir + os.sep,
+        output_name=scatter_name,
+        X_train=X_dev,
         X_test=X_test,
-        rkf_mae=rkf_mae,
-        rkf_r2=rkf_r2,
+        r2_loo=secondary.get('loo_r2'),
+        rkf_mae=secondary.get('rkf_mae_mean'),
+        rkf_r2=secondary.get('rkf_r2_mean'),
+        precomputed_metrics=metrics,
     )
-    print(f"  {model_name}: plots saved to {out_dir}/")
+
+    manual_protocol = {
+        **protocol,
+        'artifact_scope': 'manual_final_checkpoint',
+        'selection_mode': 'manual_feature_count_selection',
+        'manual_n_features': n_features,
+        'source_iteration_checkpoint': source_file,
+        'final_test_evaluations': 1,
+    }
+    manual_metrics = {
+        'primary': {
+            'final_test': {
+                'test_mae': metrics['mae_test'],
+                'test_r2': metrics['r2_test'],
+                'rmse_test': metrics['rmse_test'],
+                'r_test': metrics['r_test'],
+            }
+        },
+        'secondary': secondary,
+        'test_mae': metrics['mae_test'],
+        'test_r2': metrics['r2_test'],
+        'rmse_test': metrics['rmse_test'],
+        'mae_test_avg': metrics['mae_test'],
+        'r2_test_avg': metrics['r2_test'],
+        'rkf_mae_opt_mean': secondary.get('rkf_mae_mean'),
+        'rkf_r2_opt_mean': secondary.get('rkf_r2_mean'),
+        'mae_mean': secondary.get('mae_mean'),
+    }
+    manual_info = {
+        'model': fitted_estimator,
+        'estimator': fitted_estimator,
+        'scaler_X': scaler_X,
+        'scaler_y': scaler_y,
+        'features': features,
+        'complete_params': complete_params,
+        'hyperparameters': complete_params,
+        'metrics': manual_metrics,
+        'primary_metrics': manual_metrics['primary'],
+        'secondary_metrics': secondary,
+        'test_mae': metrics['mae_test'],
+        'test_r2': metrics['r2_test'],
+        'rmse_test': metrics['rmse_test'],
+        'optimal_n_features': n_features,
+        'manual_n_features': n_features,
+        'selection_mode': 'manual_feature_count_selection',
+        'source_iteration_checkpoint': source_file,
+        'evaluation_protocol': manual_protocol,
+    }
+
+    artifact_stem = os.path.join(model_dir, f"{model_name}_manual_final_{n_features}feat_{timestamp}")
+    checkpoint_path = f"{artifact_stem}.joblib"
+    metrics_path = f"{artifact_stem}_metrics.txt"
+    joblib.dump(manual_info, checkpoint_path)
+    _write_metrics_txt(
+        metrics_path,
+        model_name,
+        n_features,
+        features,
+        complete_params,
+        source_file,
+        manual_protocol,
+        metrics,
+        secondary,
+    )
+
+    print(f"  {model_name}: manual-final checkpoint saved to {checkpoint_path}")
+    print(f"  {model_name}: metrics saved to {metrics_path}")
+    print(f"  {model_name}: scatter saved to {os.path.join(plot_dir, scatter_name)}")
+    print(
+        f"  {model_name}: Final Test MAE={metrics['mae_test']:.4f}, "
+        f"R²={metrics['r2_test']:.4f}, RMSE={metrics['rmse_test']:.4f}"
+    )
+    return manual_info, checkpoint_path, metrics_path
 
 
 def predict_external(checkpoint_info, csv_path, output_path=None):
-    """
-    (FUTURE USE — currently commented out in main)
-
-    Use a manually selected checkpoint to predict on external data.
-
-    Parameters
-    ----------
-    checkpoint_info : dict from joblib.load()
-    csv_path : str, path to external CSV
-    output_path : str, optional output path
-    """
+    """Use a manual-final checkpoint to predict on external data."""
     model = checkpoint_info['model']
     scaler_X = checkpoint_info['scaler_X']
     scaler_y = checkpoint_info['scaler_y']
@@ -258,26 +491,18 @@ def predict_external(checkpoint_info, csv_path, output_path=None):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 if __name__ == '__main__':
-    # 1. Load manual selections
     selections = load_manual_selections(MANUAL_SELECTION_CSV)
 
-    # 2. For each model, load the checkpoint and generate plots
     for model_name, n_features in selections.items():
-        print(f"\n{'='*60}")
-        print(f"  Processing: {model_name} ({n_features} features)")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print(f"  Manual-final: {model_name} ({n_features} features)")
+        print(f"{'=' * 60}")
         try:
             info, src = find_checkpoint(model_name, n_features)
-            generate_plots(model_name, info)
-        except Exception as e:
-            print(f"  ERROR: {model_name}: {e}")
+            generate_manual_final_artifacts(model_name, n_features, info, src)
+        except Exception as exc:
+            print(f"  ERROR: {model_name}: {exc}")
             continue
 
-    print(f"\nDone. Plots saved to {OUTPUT_DIR}/")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # FUTURE: External prediction (uncomment when ready)
-    # ═══════════════════════════════════════════════════════════════════════
-    # for model_name, n_features in selections.items():
-    #     info, src = find_checkpoint(model_name, n_features)
-    #     predict_external(info, 'external_data.csv')
+    print("\nDone. Manual-final artifacts saved under models/<ModelName>/ and plots under "
+          f"{OUTPUT_DIR}/")
