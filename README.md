@@ -14,15 +14,15 @@ Active references:
 ## Requirements
 
 - Python >= 3.12
-- Recommended installer: `uv sync`
-- Alternative installer: `pip install -r requirements.txt`
+- Primary reproducible installer: `uv sync --locked`
+- Pip fallback: `requirements.txt` is a compatibility snapshot generated from the lockfile. Do not edit it by hand or treat it as a second dependency source.
 
 The default runtime includes the scikit-learn stack plus XGBoost, LightGBM, CatBoost, and `gplearn==0.4.2`.
 
 ## Quick start
 
 ```bash
-uv sync
+uv sync --locked
 python main.py --n_trials 100 --min_features 5
 python main.py --n_trials 20 --min_features 5
 python main.py --help
@@ -106,6 +106,7 @@ Legacy aliases may still appear for compatibility, but current readers should pr
 Automatic full-pipeline y-randomization remains disabled in the main workflow. The supported path is `example/standalone_y_randomization.py`, which:
 
 - loads selected checkpoints
+- runs on checkpoint development indices by default
 - reuses the same precomputed 5×5 RepeatedKFold splits for observed and permuted targets
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
 - writes each histogram to `models/y_randomization_<ModelName>.png`
@@ -126,6 +127,7 @@ Automatic full-pipeline y-randomization remains disabled in the main workflow. T
 
 Applicability-domain analysis uses:
 
+- checkpoint development indices for calibration by default
 - training-set 5-fold OOF residuals
 - MAD-based residual scaling with finite fallbacks
 - leverage in descriptor space
@@ -137,7 +139,9 @@ Prediction-only mode is leverage-only when external labels are absent; there is 
 | Argument | Default | Meaning |
 |---|---:|---|
 | `--n_trials` | `100` | Optuna trials per model on the development set |
-| `--n_jobs` | `-1` | CPU cores (`-1` = all available) |
+| `--model_jobs` | `-1` | Estimator-internal CPU parallelism (`-1` = all available where supported) |
+| `--optuna_jobs` | `1` | Optuna trial parallelism; default serial for reproducibility and resource stability |
+| `--n_jobs` | `None` | Deprecated alias for `--model_jobs` |
 | `--keep_versions` | `2` | Number of recent checkpoint families to retain |
 | `--min_features` | `5` | SHAP-RFECV feature-floor for path evaluation |
 | `--force_n_features` | `None` | Exact evaluated feature count; rejected by `main.py` for the default GPlearn-containing registry |
@@ -151,6 +155,8 @@ models/
 │   ├── <ModelName>_iteration_<N>_<timestamp>_metrics.txt
 │   ├── <ModelName>_final_<timestamp>.joblib
 │   ├── <ModelName>_final_<timestamp>_metrics.txt
+│   ├── <ModelName>_manual_final_<N>feat_<timestamp>.joblib
+│   ├── <ModelName>_manual_final_<N>feat_<timestamp>_metrics.txt
 │   ├── final_scatter_<timestamp>.png
 │   ├── final_scatter_<timestamp>_outliers.csv
 │   ├── performance_history_<timestamp>.csv
@@ -158,7 +164,7 @@ models/
 └── optimization_<timestamp>.log
 ```
 
-Iteration checkpoints store development-path results. Final checkpoints add the one-time final-test result, split metadata, fitted scalers, merged hyperparameters, and final feature order.
+Iteration checkpoints store development-path results. Final checkpoints add the one-time final-test result, split metadata, fitted scalers, merged hyperparameters, and final feature order. Manual-final checkpoints follow the same final-test protocol but use the feature count specified in `example/manual_feature_selection.csv`.
 
 ## Reproducibility notes
 
@@ -168,3 +174,4 @@ Iteration checkpoints store development-path results. Final checkpoints add the 
 - Matplotlib uses the `Agg` backend in the optimization workflow
 - `src/fixed_params.py` is the single source of truth for fixed model parameters
 - `src/evaluation.py` is the single source of truth for 5×5 RepeatedKFold evaluation
+- `uv.lock` is the exact dependency-resolution source of truth; keep `requirements.txt` generated from the lockfile when pip compatibility is needed
