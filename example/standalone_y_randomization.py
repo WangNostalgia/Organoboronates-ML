@@ -46,6 +46,7 @@ N_PERMS = 100
 RANDOM_SEED = 42
 DATA_PATH = 'example/B_dataset.csv'
 TARGET_COL = 'activation_energy'
+METADATA_COLUMNS = ('ID', 'SMILES', 'filename')
 ALLOW_FULL_DATA_WITHOUT_PROTOCOL = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -111,7 +112,11 @@ def _make_xy(data):
     if TARGET_COL not in data.columns:
         raise ValueError(f"Input data must contain target column '{TARGET_COL}'.")
     numeric_cols = data.select_dtypes(include=['number']).columns
-    X = data[numeric_cols].drop(TARGET_COL, axis=1)
+    excluded = set(METADATA_COLUMNS) | {TARGET_COL}
+    feature_cols = [col for col in numeric_cols if col not in excluded]
+    if not feature_cols:
+        raise ValueError("No numeric descriptor feature columns found for y-randomization.")
+    X = data[feature_cols]
     y = data[TARGET_COL]
     return X, y
 
@@ -168,7 +173,3 @@ def main():
             continue
 
     logger.info("All models processed. Check models/ for y_randomization_*.png")
-
-
-if __name__ == '__main__':
-    main()
