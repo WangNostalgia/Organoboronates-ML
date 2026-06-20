@@ -109,7 +109,7 @@ class ExternalValidationTests(unittest.TestCase):
         self.assertEqual(source.count("def _write_ensemble_summary("), 1)
         self.assertEqual(source.count("def main("), 1)
         self.assertNotIn("Load any final model by name", source)
-        self.assertIn("Load final or iteration checkpoints", source)
+        self.assertIn("Load final, manual-final, or iteration checkpoints", source)
 
     def test_source_has_no_paired_substrate_identifiers(self):
         source = Path("src/external_validation.py").read_text(encoding="utf-8")
@@ -417,7 +417,7 @@ class ExternalValidationTests(unittest.TestCase):
         with self.assertLogs("src.external_validation", level="WARNING"):
             with self.assertRaisesRegex(
                 FileNotFoundError,
-                "No final or iteration checkpoints found",
+                "No final, manual-final, or iteration checkpoints found",
             ):
                 load_model("SVR", models_dir=str(self.models_dir))
 
