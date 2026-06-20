@@ -4,7 +4,7 @@
 
 [English](README.md) | [中文](README_CN.md)
 
-本仓库提供一个用于 organoboronates 活化能预测的机器学习工作流。
+本仓库提供一个用于 organoboronates 活化能预测的机器学习工作流。当前任务格式是单样本回归：一个化合物 / 构象 / 记录对应一个 `activation_energy`。
 
 当前有效文档：
 
@@ -19,6 +19,21 @@
 
 默认完整环境除 scikit-learn 系列外，还需要 XGBoost、LightGBM、CatBoost，以及 `gplearn==0.4.2`。
 
+## 输入数据格式
+
+训练数据推荐格式：
+
+```text
+ID, SMILES, filename, activation_energy, descriptor_1, descriptor_2, ...
+```
+
+说明：
+
+- `activation_energy` 是训练和带标签评估所需 target。
+- `ID`、`SMILES`、`filename` 是推荐 metadata，不作为模型特征。
+- 模型特征来自数值型 descriptor columns。
+- 外部预测 CSV 可以没有 `activation_energy`；这种情况下进入 prediction-only mode。
+
 ## 快速开始
 
 ```bash
@@ -27,6 +42,15 @@ python main.py --n_trials 100 --min_features 5
 python main.py --n_trials 20 --min_features 5
 python main.py --help
 python example/standalone_y_randomization.py
+```
+
+训练后常用命令：
+
+```bash
+python example/manual_selection_and_plot.py
+python src/external_validation.py --list-models
+python src/external_validation.py --model SVR --n_features 5 --data external.csv
+python src/applicability_domain.py --model SVR --n_features 5 --training example/B_dataset.csv --external external.csv
 ```
 
 ## 当前默认模型注册表
@@ -61,14 +85,15 @@ python example/standalone_y_randomization.py
 - Development 集：调参、SHAP 特征消除、特征数路径评估、内部 5×5 RepeatedKFold、LOOCV、100-split stability
 - Final test 集：在特征数和超参数锁定后只评估一次
 
-测试集不参与模型选择。
+测试集不参与模型选择。Split indices 会保存到 checkpoint 的 `evaluation_protocol` 中，并被后处理脚本复用。
 
 ### 2. 只在 development 上调参
 
 `src/train_and_evaluate.py` 只用 development 数据调参。
 
 - Optuna 目标函数是内部 5-fold MAE
-- Optuna study 为内存对象
+- Optuna trial 并行由 `--optuna_jobs` 控制，默认 `1`
+- 模型内部并行由 `--model_jobs` 控制，默认 `-1`
 - Ridge 和 Lasso 使用显式的 fold-local alpha 循环
 - 每折只在训练部分拟合 scaler，再把预测值逆变换回 kcal/mol 后计算 MAE / R²
 
@@ -79,11 +104,26 @@ python example/standalone_y_randomization.py
 - 若存在高相关特征对，先删 SHAP 更弱的那个
 - 否则删全局最不重要的特征
 
-路径会持续到配置的特征数下限。`--min_features` 默认是 `5`。
+多折 SHAP consensus 中，非树模型的 background / masker 来自 training fold，而不是 held-out fold。路径会持续到配置的特征数下限。`--min_features` 默认是 `5`。
 
 `--force_n_features` 表示“先评估完整路径，再强制选择某个已评估的特征数”。但默认注册表仍包含 GPlearn，因此 `main.py` 会立即拒绝这个选项；精确特征数强制选择只适用于排除 GPlearn 的自定义注册表。
 
-### 4. 指标角色与 checkpoint schema
+### 4. 自动 final 与 manual-final
+
+自动 final checkpoint 会在 development-only 证据确定特征数和超参数后生成，然后 final test 只评估一次。
+
+Manual-final checkpoint 由 `example/manual_selection_and_plot.py` 根据 `example/manual_feature_selection.csv` 生成。该脚本会：
+
+- 精确加载指定特征数的 iteration checkpoint
+- 不允许 closest-feature fallback
+- 复用 checkpoint 中保存的 development/final-test indices
+- 用 selected features 和完整参数在 development rows 上重新拟合
+- final test 只评估一次
+- 保存 manual-final checkpoint、metrics txt 和带有 manual feature-count selection 标记的 scatter plot
+
+Manual 特征数必须在查看 final-test 图之前，根据 development-only 证据和化学可解释性决定。
+
+### 5. 指标角色与 checkpoint schema
 
 Final checkpoints 使用嵌套指标：
 
@@ -101,7 +141,7 @@ Iteration checkpoints 保存 development 路径指标：
 
 兼容旧字段可能仍会出现，但当前读取逻辑应优先使用新字段，只在必要时 fallback。
 
-### 5. Standalone y-randomization
+### 6. Standalone y-randomization
 
 主流程中仍不自动运行 full-pipeline y-randomization。支持的路径是 `example/standalone_y_randomization.py`，该脚本：
 
@@ -111,7 +151,7 @@ Iteration checkpoints 保存 development 路径指标：
 - 报告有限置换修正 p-value `(b + 1) / (m + 1)`
 - 将直方图写入 `models/y_randomization_<ModelName>.png`
 
-### 6. Checkpoint 加载
+### 7. Checkpoint 加载
 
 `src.external_validation.load_model()`：
 
@@ -123,15 +163,29 @@ Iteration checkpoints 保存 development 路径指标：
 
 `example/load_checkpoint_guide.py` 使用同样的选择逻辑，并能安全格式化当前和旧版指标布局。
 
-### 7. Applicability domain
+### 8. 外部验证与 metadata 保留
+
+`src/external_validation.py` 支持单模型和 ensemble 外部验证。
+
+预测输出默认保留：
+
+- `ID`、`SMILES`、`filename` 等优先 metadata
+- 所有其他非 feature、非 target 的 metadata columns
+- 模型实际使用的 feature columns
+- `predicted_activation_energy`
+- 如果存在真实标签，则额外加入 `activation_energy` 和误差列
+
+可以用 `--id-cols` 指定 metadata 优先顺序；如果不想保留所有 metadata，可以加 `--only-id-cols`。
+
+### 9. Applicability domain
 
 Applicability-domain 分析默认使用 checkpoint development indices 进行校准，并使用：
 
-- 训练集 5-fold OOF residuals
+- training/development rows 的 5-fold OOF residuals
 - MAD-based residual scale，并带有限值 fallback
 - descriptor space leverage
 
-当外部数据没有标签时，prediction-only mode 只使用 leverage；没有外部 `sqrt(1-h)` 修正项。
+只有在明确接受 full-CSV 校准时才使用 `--allow-full-training-csv-for-ad`。当外部数据没有标签时，prediction-only mode 只使用 leverage；没有外部 `sqrt(1-h)` 修正项。
 
 ## `main.py` CLI 参数
 
