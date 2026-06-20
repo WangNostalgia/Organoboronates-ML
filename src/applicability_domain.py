@@ -1,5 +1,9 @@
 """
 Applicability-domain analysis for trained organoboronate ML models.
+
+The command-line entry point calibrates the AD reference set from the
+checkpoint's saved development_indices by default, so final-test rows are not
+silently reused as part of the training domain.
 """
 
 import argparse
@@ -24,10 +28,25 @@ DEFAULT_Z_THRESHOLD = 3.0
 DEFAULT_MODELS_DIR = 'models'
 DEFAULT_TARGET_COL = 'activation_energy'
 DEFAULT_OUTPUT_DIR = 'applicability_domain_results'
+DEFAULT_METADATA_COLUMNS = ('ID', 'SMILES', 'filename')
 
 LINEAR_LEVERAGE_MODELS = {
     'LinearRegression', 'Ridge', 'Lasso', 'ElasticNet',
 }
+
+
+def _identifier_columns(df):
+    return [col for col in DEFAULT_METADATA_COLUMNS if col in df.columns]
+
+
+def _unique_preserving_order(columns):
+    seen = set()
+    result = []
+    for col in columns:
+        if col not in seen:
+            result.append(col)
+            seen.add(col)
+    return result
 
 
 def applicability_domain_analysis(model_info, X_train, X_external,
@@ -37,9 +56,7 @@ def applicability_domain_analysis(model_info, X_train, X_external,
                                   z_threshold=DEFAULT_Z_THRESHOLD,
                                   output_dir=DEFAULT_OUTPUT_DIR,
                                   model_name='Model'):
-    """
-    Assess the applicability domain of a trained model for an external set.
-    """
+    """Assess the applicability domain of a trained model for an external set."""
     X_train = _to_dataframe(X_train, 'training')
     X_external = _to_dataframe(X_external, 'external')
 
@@ -120,8 +137,8 @@ def applicability_domain_analysis(model_info, X_train, X_external,
         z_threshold=z_threshold,
     )
 
-    id_cols = [c for c in ['sub_H', 'sub_B'] if c in X_external.columns]
-    results_df = X_external[id_cols + expected_features].copy().reset_index(drop=True)
+    result_cols = _unique_preserving_order(_identifier_columns(X_external) + expected_features)
+    results_df = X_external[result_cols].copy().reset_index(drop=True)
     results_df['predicted_activation_energy'] = y_pred_external
     if y_external_arr is not None:
         results_df['activation_energy'] = y_external_arr
@@ -187,9 +204,7 @@ def applicability_domain_analysis(model_info, X_train, X_external,
 
 def _compute_williams(X_train_scaled, X_ext_scaled, model, y_train, y_external,
                       y_pred_external, p, n_train, X_train_unscaled):
-    """
-    Compute descriptor-space leverage and calibrated standardized residuals.
-    """
+    """Compute descriptor-space leverage and calibrated standardized residuals."""
     X_with_intercept = np.column_stack([np.ones(n_train), X_train_scaled])
     try:
         leverage_train = _hat_matrix_diag(X_with_intercept)
@@ -271,9 +286,7 @@ def _hat_matrix_diag_pinv(X):
 
 
 def _training_oof_predictions(model, X, y, n_splits=5, random_state=42):
-    """
-    Generate one OOF prediction per training sample in kcal/mol.
-    """
+    """Generate one OOF prediction per training sample in kcal/mol."""
     X_df = _to_dataframe(X, 'training')
     y_arr = _validate_target_array(y, len(X_df), 'y_train')
     _validate_feature_matrix(X_df, 'training')
@@ -314,188 +327,106 @@ def _training_oof_predictions(model, X, y, n_splits=5, random_state=42):
 
 
 def _oof_residual_scale(residuals):
-    """
-    Robust Williams residual scale from finite 1-D OOF residuals.
-    """
+    """Robust Williams residual scale from finite 1-D OOF residuals."""
     residuals_arr = np.asarray(residuals, dtype=float)
-    if residuals_arr.ndim != 1 or residuals_arr.size == 0:
-        raise ValueError("residuals must be a non-empty 1-D array.")
-    if not np.isfinite(residuals_arr).all():
-        raise ValueError("residuals must contain only finite values.")
-
-    m = np.median(residuals_arr)
-    scale = 1.4826 * np.median(np.abs(residuals_arr - m))
-    if scale == 0:
-        scale = np.std(residuals_arr, ddof=1)
-    if not np.isfinite(scale) or scale == 0:
+    residuals_arr = residuals_arr[np.isfinite(residuals_arr)]
+    if residuals_arr.size == 0:
+        raise ValueError("Cannot calibrate residual scale from empty residuals.")
+    median = np.median(residuals_arr)
+    mad = np.median(np.abs(residuals_arr - median))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= np.finfo(float).eps:
+        scale = float(np.std(residuals_arr, ddof=1)) if residuals_arr.size > 1 else 0.0
+    if not np.isfinite(scale) or scale <= np.finfo(float).eps:
         scale = np.finfo(float).eps
     return float(scale)
 
 
 def _compute_knn_distance(X_train_scaled, X_ext_scaled, k_neighbors, z_threshold):
-    """
-    Compute average Euclidean distance to the k nearest training neighbours.
-    """
-    n_train = len(X_train_scaled)
-    if not isinstance(k_neighbors, (int, np.integer)):
-        raise ValueError("k_neighbors must be an integer.")
-    if k_neighbors < 1 or k_neighbors > (n_train - 1):
-        raise ValueError(f"k_neighbors must be between 1 and {n_train - 1} for {n_train} training samples.")
+    """Compute k-NN descriptor-space distance warnings."""
+    train_neighbor_count = min(k_neighbors + 1, len(X_train_scaled))
+    train_nn = NearestNeighbors(n_neighbors=train_neighbor_count, n_jobs=1)
+    train_nn.fit(X_train_scaled)
+    train_distances, _ = train_nn.kneighbors(X_train_scaled)
+    if train_neighbor_count > 1:
+        train_reference_dist = train_distances[:, 1:].mean(axis=1)
+    else:
+        train_reference_dist = train_distances[:, 0]
 
-    nn = NearestNeighbors(
-        n_neighbors=k_neighbors + 1,
-        metric='euclidean',
-        n_jobs=1,
-    )
-    nn.fit(X_train_scaled)
+    training_mean = float(np.mean(train_reference_dist))
+    training_std = float(np.std(train_reference_dist, ddof=1)) if len(train_reference_dist) > 1 else 0.0
+    if not np.isfinite(training_std):
+        training_std = 0.0
+    threshold = training_mean + float(z_threshold) * training_std
 
-    train_distances, _ = nn.kneighbors(X_train_scaled)
-    train_knn_avg = train_distances[:, 1:k_neighbors + 1].mean(axis=1)
-    train_mean = float(np.mean(train_knn_avg))
-    train_std = float(np.std(train_knn_avg, ddof=1)) if len(train_knn_avg) > 1 else 0.0
-    threshold = train_mean + z_threshold * max(train_std, 1e-8)
+    ext_neighbor_count = min(k_neighbors, len(X_train_scaled))
+    ext_nn = NearestNeighbors(n_neighbors=ext_neighbor_count, n_jobs=1)
+    ext_nn.fit(X_train_scaled)
+    ext_distances, _ = ext_nn.kneighbors(X_ext_scaled)
+    distances_ext = ext_distances.mean(axis=1)
 
-    ext_distances, _ = nn.kneighbors(X_ext_scaled, n_neighbors=k_neighbors)
-    ext_knn_avg = ext_distances.mean(axis=1)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        z_scores_ext = np.where(
-            train_std > 0,
-            (ext_knn_avg - train_mean) / train_std,
-            0.0,
-        )
-    warnings_ext = ext_knn_avg > threshold
+    if training_std > np.finfo(float).eps:
+        z_scores_ext = (distances_ext - training_mean) / training_std
+    else:
+        z_scores_ext = np.where(distances_ext > training_mean, np.inf, 0.0)
+    warnings_ext = distances_ext > threshold
 
     return {
-        'distances_train': train_knn_avg,
-        'distances_ext': ext_knn_avg,
+        'train_distances': train_reference_dist,
+        'distances_ext': distances_ext,
         'z_scores_ext': z_scores_ext,
-        'warnings_ext': warnings_ext,
-        'training_mean': train_mean,
-        'training_std': train_std,
         'threshold': threshold,
-        'k_effective': k_neighbors,
+        'training_mean': training_mean,
+        'training_std': training_std,
+        'warnings_ext': warnings_ext,
     }
 
 
 def _plot_williams(williams_data, model_name, output_path):
-    leverage_ext = np.asarray(williams_data['leverage_ext'], dtype=float)
-    std_residuals = np.asarray(williams_data['std_residuals_ext'], dtype=float)
-    h_star = float(williams_data['h_star'])
-    residual_critical = float(williams_data['residual_critical'])
-    warnings = np.asarray(williams_data['warnings_ext'], dtype=bool)
-    residuals_available = bool(williams_data.get('residuals_available', np.isfinite(std_residuals).any()))
-
-    plot_residuals = np.where(np.isfinite(std_residuals), std_residuals, 0.0)
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    normal_mask = ~warnings
-    if normal_mask.any():
-        ax.scatter(
-            leverage_ext[normal_mask],
-            plot_residuals[normal_mask],
-            alpha=0.6,
-            edgecolors='#2c3e50',
-            facecolors='#3498db',
-            s=50,
-            linewidth=0.3,
-            label='Within AD',
-            zorder=5,
-        )
-    if warnings.any():
-        ax.scatter(
-            leverage_ext[warnings],
-            plot_residuals[warnings],
-            alpha=0.8,
-            edgecolors='#922b21',
-            facecolors='#e74c3c',
-            s=70,
-            linewidth=0.5,
-            marker='^',
-            label=f'Outside AD ({warnings.sum()})',
-            zorder=6,
-        )
-
-    x_max = max(float(np.max(leverage_ext)) if len(leverage_ext) else 0.0, h_star * 1.5, 1e-8) * 1.1
-    finite_abs = np.abs(std_residuals[np.isfinite(std_residuals)])
-    y_max = max(float(np.max(finite_abs)) if finite_abs.size else 0.0, residual_critical) * 1.3
-
-    ax.axvline(x=h_star, color='#e67e22', linestyle='--', linewidth=1.5, label=f'h* = {h_star:.4f}')
-    ax.axhline(y=0, color='gray', linewidth=0.5, alpha=0.5)
-
-    if residuals_available:
-        ax.axhline(y=residual_critical, color='#e67e22', linestyle=':', linewidth=1.2)
-        ax.axhline(y=-residual_critical, color='#e67e22', linestyle=':', linewidth=1.2,
-                   label=f'±{residual_critical:.0f}σ residual')
-        ax.fill_between([h_star, x_max], -residual_critical, residual_critical, alpha=0.04, color='orange')
-        ax.fill_between([0, x_max], residual_critical, y_max, alpha=0.04, color='orange')
-        ax.fill_between([0, x_max], -y_max, -residual_critical, alpha=0.04, color='orange')
-        ax.set_ylabel('Standardized Residual', fontsize=13)
-        title_suffix = 'Applicability Domain Assessment'
-    else:
-        ax.set_ylabel('Residual unavailable (prediction-only)', fontsize=13)
-        title_suffix = 'Leverage-only View'
-
-    ax.set_xlabel(williams_data.get('leverage_xlabel', 'Leverage (h)'), fontsize=13)
-    ax.set_title(f'{model_name} — Williams Plot\n{title_suffix}', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
-    ax.set_xlim(0, x_max)
-    ax.set_ylim(-y_max, y_max)
-    ax.grid(True, alpha=0.2, linestyle='--')
-
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    leverage_ext = williams_data['leverage_ext']
+    std_resid = williams_data['std_residuals_ext']
+    y_values = np.nan_to_num(std_resid, nan=0.0, posinf=0.0, neginf=0.0)
+    ax.scatter(leverage_ext, y_values, alpha=0.8, edgecolors='black', linewidths=0.5)
+    ax.axvline(williams_data['h_star'], linestyle='--', linewidth=1.2, label='h*')
+    ax.axhline(williams_data['residual_critical'], linestyle=':', linewidth=1.0)
+    ax.axhline(-williams_data['residual_critical'], linestyle=':', linewidth=1.0)
+    ax.set_xlabel(williams_data['leverage_xlabel'])
+    ax.set_ylabel('Standardized residual')
+    ax.set_title(f'Williams plot — {model_name}')
+    ax.legend()
+    fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 
 def _plot_knn_distance(knn_data, k_neighbors, model_name, output_path):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
-
-    train_dist = np.asarray(knn_data['distances_train'], dtype=float)
-    ext_dist = np.asarray(knn_data['distances_ext'], dtype=float)
-    threshold = float(knn_data['threshold'])
-
-    ax1.hist(train_dist, bins=30, alpha=0.6, color='#3498db',
-             label=f'Training (n={len(train_dist)})', edgecolor='#2c3e50', linewidth=0.3)
-    ax1.hist(ext_dist, bins=30, alpha=0.7, color='#e74c3c',
-             label=f'External (n={len(ext_dist)})', edgecolor='#922b21', linewidth=0.3)
-    ax1.axvline(x=threshold, color='#e67e22', linestyle='--', linewidth=2,
-                label=f'Threshold = {threshold:.3f}')
-    ax1.set_xlabel(f'Average Distance to {k_neighbors} Nearest Neighbours', fontsize=11)
-    ax1.set_ylabel('Count', fontsize=11)
-    ax1.set_title('k-NN Distance Distribution', fontsize=13, fontweight='bold')
-    ax1.legend(fontsize=9, framealpha=0.9)
-
-    indices = np.arange(len(ext_dist))
-    colors = ['#e74c3c' if d > threshold else '#3498db' for d in ext_dist]
-    ax2.bar(indices, ext_dist, color=colors, alpha=0.8, width=0.8)
-    ax2.axhline(y=threshold, color='#e67e22', linestyle='--', linewidth=2,
-                label=f'Threshold = {threshold:.3f}')
-    ax2.set_xlabel('External Compound Index', fontsize=11)
-    ax2.set_ylabel(f'Avg Distance to {k_neighbors} NN', fontsize=11)
-    ax2.set_title('Per-Compound k-NN Distance', fontsize=13, fontweight='bold')
-    ax2.legend(fontsize=9)
-
-    fig.suptitle(f'{model_name} — k-NN Applicability Domain', fontsize=14, fontweight='bold', y=1.01)
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    x = np.arange(len(knn_data['distances_ext']))
+    ax.scatter(x, knn_data['distances_ext'], alpha=0.8, edgecolors='black', linewidths=0.5)
+    ax.axhline(knn_data['threshold'], linestyle='--', linewidth=1.2, label='threshold')
+    ax.set_xlabel('External sample index')
+    ax.set_ylabel(f'Mean distance to {k_neighbors} nearest training neighbours')
+    ax.set_title(f'k-NN AD distance — {model_name}')
+    ax.legend()
+    fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 
-def _write_ad_summary(summary_path, model_name, ad_summary, features):
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        f.write("Applicability Domain Analysis Summary\n")
-        f.write(f"{'=' * 50}\n")
-        f.write(f"Model:        {model_name}\n")
-        f.write(f"Features:     {', '.join(features)}\n")
-        f.write(f"Timestamp:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+def _write_ad_summary(path, model_name, ad_summary, features):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("Applicability Domain Summary\n")
+        f.write("============================\n\n")
+        f.write(f"Model:                          {model_name}\n")
+        f.write(f"Features ({len(features)}):              {', '.join(features)}\n")
         f.write(f"Total external samples:          {ad_summary['n_total']}\n")
         f.write("\n--- Williams Plot ---\n")
-        f.write(f"Leverage threshold (h*):        {ad_summary['h_star']:.6f}\n")
-        f.write(f"Residual threshold:             ±{ad_summary['residual_critical']:.0f}σ\n")
-        f.write(f"High leverage (>h*):            {ad_summary['n_williams_high_leverage']}\n")
-        f.write(f"High residual:                  {ad_summary['n_williams_high_residual']}\n")
-        f.write(f"Total Williams warnings:        {ad_summary['n_williams_warning']}\n")
-        f.write(f"Leverage note:                  {ad_summary['leverage_note']}\n")
+        f.write(f"Leverage threshold h*:           {ad_summary['h_star']:.6f}\n")
+        f.write(f"High leverage:                   {ad_summary['n_williams_high_leverage']}\n")
+        f.write(f"High residual:                   {ad_summary['n_williams_high_residual']}\n")
+        f.write(f"Williams warnings:               {ad_summary['n_williams_warning']}\n")
+        f.write(f"Note:                            {ad_summary['leverage_note']}\n")
         f.write("\n--- k-NN Distance ---\n")
         f.write(f"Training mean distance:         {ad_summary['knn_training_mean']:.4f}\n")
         f.write(f"Training std distance:          {ad_summary['knn_training_std']:.4f}\n")
@@ -503,15 +434,13 @@ def _write_ad_summary(summary_path, model_name, ad_summary, features):
         f.write(f"k-NN warnings:                  {ad_summary['n_knn_warning']}\n")
         f.write("\n--- Combined ---\n")
         f.write(f"Compounds flagged:              {ad_summary['n_combined_warning']}\n")
-        flagged_percentage = (
-            100.0 * ad_summary['n_combined_warning'] / max(ad_summary['n_total'], 1)
-        )
+        flagged_percentage = 100.0 * ad_summary['n_combined_warning'] / max(ad_summary['n_total'], 1)
         f.write(f"Percentage flagged:             {flagged_percentage:.1f}%\n")
         f.write("\n--- Interpretation ---\n")
         if ad_summary.get('prediction_only', False):
             f.write(
-                "Prediction-only mode: flagged samples fall outside the "
-                "leverage and/or k-NN distance criteria.\n"
+                "Prediction-only mode: flagged samples fall outside the leverage "
+                "and/or k-NN distance criteria.\n"
             )
         elif ad_summary['n_combined_warning']:
             f.write(
@@ -520,8 +449,8 @@ def _write_ad_summary(summary_path, model_name, ad_summary, features):
             )
         else:
             f.write(
-                "All external samples satisfy the configured Williams-plot "
-                "and k-NN applicability-domain criteria.\n"
+                "All external samples satisfy the configured Williams-plot and "
+                "k-NN applicability-domain criteria.\n"
             )
 
 
@@ -564,6 +493,44 @@ def _uses_descriptor_space_leverage_approximation(model):
     return model.__class__.__name__ not in LINEAR_LEVERAGE_MODELS
 
 
+def _subset_training_to_checkpoint_development(training_df, model_info, allow_full_training_csv_for_ad):
+    protocol = model_info.get('evaluation_protocol') or {}
+    development_indices = protocol.get('development_indices')
+
+    if allow_full_training_csv_for_ad:
+        logger.warning(
+            "Using the full --training CSV for AD calibration because "
+            "--allow-full-training-csv-for-ad was provided. This can mix final-test "
+            "rows into the AD reference domain."
+        )
+        return training_df.copy()
+
+    if not development_indices:
+        raise ValueError(
+            "Checkpoint does not contain evaluation_protocol['development_indices']; "
+            "AD calibration refuses to use the full training CSV by default. Re-run "
+            "main.py to create protocol-aware checkpoints, or pass "
+            "--allow-full-training-csv-for-ad for explicitly acknowledged legacy use."
+        )
+
+    missing = [idx for idx in development_indices if idx not in training_df.index]
+    if missing:
+        preview = missing[:10]
+        raise ValueError(
+            "Checkpoint development_indices do not match the supplied --training CSV. "
+            f"Missing index labels: {preview}. Use the same, unreordered source CSV "
+            "used during main.py training, or pass --allow-full-training-csv-for-ad "
+            "only if you intentionally accept full-data AD calibration."
+        )
+
+    subset = training_df.loc[development_indices].copy()
+    logger.info(
+        "AD calibration uses %d checkpoint development rows; final-test rows remain outside the training domain.",
+        len(subset),
+    )
+    return subset
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Applicability Domain Analysis for Organoboronate ML Models',
@@ -573,7 +540,7 @@ def main():
     parser.add_argument('--n_features', type=int, default=None,
                         help='Feature count for the model version.')
     parser.add_argument('--training', type=str, required=True,
-                        help='Path to training data CSV.')
+                        help='Path to the original training-data CSV.')
     parser.add_argument('--external', type=str, required=True,
                         help='Path to external compounds CSV to assess.')
     parser.add_argument('--target-col', type=str, default=DEFAULT_TARGET_COL,
@@ -585,7 +552,13 @@ def main():
     parser.add_argument('--output-dir', type=str, default=DEFAULT_OUTPUT_DIR,
                         help=f'Output directory (default: {DEFAULT_OUTPUT_DIR}).')
     parser.add_argument('--models-dir', type=str, default=DEFAULT_MODELS_DIR,
-                        help=f'Models directory (default: {DEFAULT_MODELS_DIR}).')
+                        help=f'Directory containing trained models. Default: {DEFAULT_MODELS_DIR}')
+    parser.add_argument(
+        '--allow-full-training-csv-for-ad',
+        action='store_true',
+        help='Explicitly allow AD calibration on the full --training CSV. By default, '
+             'the checkpoint development_indices are used and final-test rows are excluded.',
+    )
 
     args = parser.parse_args()
 
@@ -598,16 +571,21 @@ def main():
     from src.external_validation import load_model
 
     model_info = load_model(args.model, n_features=args.n_features, models_dir=args.models_dir)
-    X_train = _to_dataframe(args.training, 'training')
+    training_df = _to_dataframe(args.training, 'training')
+    training_reference = _subset_training_to_checkpoint_development(
+        training_df,
+        model_info,
+        allow_full_training_csv_for_ad=args.allow_full_training_csv_for_ad,
+    )
     X_external = _to_dataframe(args.external, 'external')
 
-    if args.target_col not in X_train.columns:
+    if args.target_col not in training_reference.columns:
         raise ValueError(
             f"Training CSV must contain target column '{args.target_col}' so Williams residuals can be calibrated."
         )
 
-    y_train = X_train[args.target_col].to_numpy(dtype=float)
-    X_train = X_train.drop(columns=[args.target_col])
+    y_train = training_reference[args.target_col].to_numpy(dtype=float)
+    X_train = training_reference.drop(columns=[args.target_col])
 
     y_external = None
     if args.target_col in X_external.columns:
