@@ -23,7 +23,6 @@ from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 
 from src.evaluation import repeated_kfold_evaluate
-from src.fixed_params import get_fixed_params
 from src.gplearn_wrapper import GPLearnRegressor
 from src.model_utils import build_model
 
@@ -321,16 +320,33 @@ def _normalize_best_params(model_class, best_params):
     return best_params
 
 
-def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=-1):
+def _validate_optuna_jobs(optuna_jobs):
+    if not isinstance(optuna_jobs, (int, np.integer)):
+        raise ValueError("optuna_jobs must be an integer.")
+    if int(optuna_jobs) < 1:
+        raise ValueError("optuna_jobs must be at least 1.")
+    return int(optuna_jobs)
+
+
+def train_and_evaluate(
+    model_class,
+    X,
+    y,
+    random_state=42,
+    n_trials=100,
+    n_jobs=-1,
+    optuna_jobs=1,
+):
     """
     Select model hyperparameters using development data only.
 
-    The returned estimator is intentionally unfitted. Downstream stages can fit
-    it on whatever fold or feature subset they need without inheriting any
-    hidden train/test split from this selection stage.
+    n_jobs controls estimator-internal parallelism. optuna_jobs controls Optuna
+    trial parallelism and defaults to 1 to avoid nested parallel resource
+    explosion and nondeterministic TPE scheduling.
     """
-
-    logger.info("n_jobs: %s", n_jobs)
+    optuna_jobs = _validate_optuna_jobs(optuna_jobs)
+    logger.info("model n_jobs: %s", n_jobs)
+    logger.info("optuna_jobs: %s", optuna_jobs)
 
     if model_class == Ridge:
         best_alpha, development_cv_mae = _select_alpha_via_inner_cv(
@@ -375,7 +391,7 @@ def train_and_evaluate(model_class, X, y, random_state=42, n_trials=100, n_jobs=
             sampler=sampler,
             direction="minimize",
         )
-        study.optimize(objective, n_jobs=n_jobs, n_trials=n_trials)
+        study.optimize(objective, n_jobs=optuna_jobs, n_trials=n_trials)
 
         development_cv_mae = float(study.best_value)
         best_params = _normalize_best_params(model_class, study.best_params)
