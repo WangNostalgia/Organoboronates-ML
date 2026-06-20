@@ -143,6 +143,23 @@ class StandaloneYRandomizationTests(unittest.TestCase):
         self.assertNotIn("models/<ModelName>/y_randomization_<ModelName>.png", source)
         self.assertIn("Check models/ for y_randomization_*.png", source)
 
+    def test_make_xy_excludes_numeric_metadata_columns(self):
+        data = pd.DataFrame(
+            {
+                "ID": [101, 102, 103],
+                "SMILES": ["C", "CC", "CCC"],
+                "filename": ["a.log", "b.log", "c.log"],
+                "activation_energy": [1.0, 2.0, 3.0],
+                "f1": [0.1, 0.2, 0.3],
+                "f2": [1.1, 1.2, 1.3],
+            }
+        )
+
+        X, y = standalone_y_randomization._make_xy(data)
+
+        self.assertEqual(X.columns.tolist(), ["f1", "f2"])
+        self.assertEqual(y.tolist(), [1.0, 2.0, 3.0])
+
     def test_main_uses_exact_checkpoint_loading_and_stored_estimator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -177,6 +194,10 @@ class StandaloneYRandomizationTests(unittest.TestCase):
                     "model": stored_model,
                     "features": ["f1", "f2"],
                     "hyperparameters": {"alpha": 999.0},
+                    "evaluation_protocol": {
+                        "development_indices": [0, 1, 2, 3, 4],
+                        "final_test_indices": [],
+                    },
                 }
 
             def fake_y_randomization_test(**kwargs):
