@@ -4,6 +4,7 @@ import re
 import tempfile
 from datetime import datetime
 from numbers import Integral
+from pprint import pformat
 
 import joblib
 import matplotlib
@@ -26,6 +27,11 @@ from src.logger_config import setup_logger
 from src.visualization import plot_scatter
 
 plt.rcParams["font.family"] = "DejaVu Sans"
+
+
+INTERNAL_CV_LABEL = "Internal 5×5 RepeatedKFold CV"
+RKF_PLOT_LABEL = "5×5 RKFold"
+STABILITY_PLOT_LABEL = "100-split MAE"
 
 
 def _validate_keep_versions(keep_versions):
@@ -53,9 +59,7 @@ def clean_old_versions(model_dir, keep_versions=2):
     )
     artifact_patterns = (
         final_pattern,
-        re.compile(
-            rf"^{escaped_model_name}_final_{timestamp_pattern}_metrics\.txt$"
-        ),
+        re.compile(rf"^{escaped_model_name}_final_{timestamp_pattern}_metrics\.txt$"),
         iteration_pattern,
         re.compile(
             rf"^{escaped_model_name}_iteration_\d+_"
@@ -82,9 +86,7 @@ def clean_old_versions(model_dir, keep_versions=2):
                 final_timestamps.add(timestamp)
             break
 
-    retained_timestamps = set(
-        sorted(final_timestamps, reverse=True)[:keep_versions]
-    )
+    retained_timestamps = set(sorted(final_timestamps, reverse=True)[:keep_versions])
 
     for filepath, timestamp in matched_artifacts:
         if timestamp in retained_timestamps:
@@ -126,9 +128,7 @@ def _evaluate_final_test_once(
     """Generate final predictions and calculate the two primary metrics once."""
     X_development_scaled = scaler_X.transform(X_development)
     X_final_test_scaled = scaler_X.transform(X_final_test)
-    y_pred_development = _inverse_predict(
-        estimator, scaler_y, X_development_scaled
-    )
+    y_pred_development = _inverse_predict(estimator, scaler_y, X_development_scaled)
     y_pred_final_test = _inverse_predict(estimator, scaler_y, X_final_test_scaled)
 
     test_mae = float(mean_absolute_error(y_final_test, y_pred_final_test))
@@ -159,6 +159,59 @@ def _safe_loo(estimator, X_development, y_development, logger, context):
     except (ValueError, np.linalg.LinAlgError) as exc:
         logger.warning("LOOCV failed for %s: %s", context, exc, exc_info=True)
         return float("nan"), float("nan")
+
+
+def _params_one_line(params):
+    """Return a compact one-line representation without dropping any parameter."""
+    return pformat(dict(params), compact=True, width=1_000_000, sort_dicts=True)
+
+
+def _write_params_block(handle, title, params):
+    handle.write(f"\n--- {title} ---\n")
+    handle.write(_params_one_line(params))
+    handle.write("\n")
+
+
+def _write_iteration_path_table(handle, shap_rfecv_path, selected_n_features=None):
+    """Write one machine-readable-ish row per evaluated feature-count checkpoint."""
+    if not shap_rfecv_path:
+        handle.write("\n--- Iteration Parameter Path ---\n")
+        handle.write("No iterative SHAP-RFECV path was recorded for this model.\n")
+        return
+
+    columns = [
+        "Iter",
+        "Feat",
+        "Selected",
+        "Removed_before",
+        f"{INTERNAL_CV_LABEL} MAE",
+        f"{INTERNAL_CV_LABEL} R2",
+        "LOOCV R2",
+        "LOOCV MAE",
+        "100-split MAE",
+        "Complete Parameters",
+    ]
+    handle.write("\n--- Iteration Parameter Path ---\n")
+    handle.write("\t".join(columns) + "\n")
+    for entry in shap_rfecv_path:
+        metrics = entry["metrics"]
+        internal_cv = metrics["internal_cv"]
+        stability = metrics["stability"]
+        loo = metrics["loo"]
+        selected = "yes" if entry["n_features"] == selected_n_features else ""
+        row = [
+            str(entry["iteration"]),
+            str(entry["n_features"]),
+            selected,
+            ", ".join(entry.get("removed_features", [])),
+            f"{internal_cv['rkf_mae_mean']:.4f} ± {internal_cv['rkf_mae_std']:.4f}",
+            f"{internal_cv['rkf_r2_mean']:.4f} ± {internal_cv['rkf_r2_std']:.4f}",
+            f"{loo['r2']:.4f}",
+            f"{loo['mae']:.4f}",
+            f"{stability['mae_mean']:.4f} ± {stability['mae_std']:.4f}",
+            _params_one_line(entry["complete_params"]),
+        ]
+        handle.write("\t".join(row) + "\n")
 
 
 def _make_path_entry(
@@ -230,9 +283,7 @@ def _append_performance_history(history, entry, removed_feature):
 
 def _select_path_entry(path, force_n_features, logger):
     if force_n_features is not None:
-        matches = [
-            entry for entry in path if entry["n_features"] == force_n_features
-        ]
+        matches = [entry for entry in path if entry["n_features"] == force_n_features]
         if not matches:
             available = sorted(entry["n_features"] for entry in path)
             raise ValueError(
@@ -250,9 +301,7 @@ def _select_path_entry(path, force_n_features, logger):
         key=lambda entry: entry["metrics"]["internal_cv"]["rkf_mae_mean"],
     )
     minimum_mae = minimum_entry["metrics"]["internal_cv"]["rkf_mae_mean"]
-    minimum_std = minimum_entry["metrics"]["internal_cv"].get(
-        "rkf_mae_std", 0.0
-    )
+    minimum_std = minimum_entry["metrics"]["internal_cv"].get("rkf_mae_std", 0.0)
     threshold = minimum_mae + 0.25 * max(minimum_std, 1e-8)
     candidates = [
         entry
@@ -261,8 +310,9 @@ def _select_path_entry(path, force_n_features, logger):
     ]
     selected = min(candidates, key=lambda entry: entry["n_features"])
     logger.info(
-        "Development internal-CV selection: minimum MAE %.4f ± %.4f; "
+        "Development %s selection: minimum MAE %.4f ± %.4f; "
         "fractional 1-SE threshold %.4f; selected %d features",
+        INTERNAL_CV_LABEL,
         minimum_mae,
         minimum_std,
         threshold,
@@ -290,9 +340,7 @@ def _make_result(
             }
         },
         "secondary": {
-            "development_cv_mae": selected_entry["metrics"][
-                "development_cv_mae"
-            ],
+            "development_cv_mae": selected_entry["metrics"]["development_cv_mae"],
             "internal_cv": internal_cv,
             "stability": stability,
             "loo": loo,
@@ -342,9 +390,11 @@ def _write_final_metrics(
     selection_mode = "exact forced count" if force_n_features is not None else "auto-selected"
 
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"Model: {model_name} (Final — {selection_mode})\n")
-        handle.write(f"Features ({len(result['final_features'])}): {', '.join(result['final_features'])}\n")
-        handle.write("\n--- PRIMARY: Untouched Final Test (evaluated exactly once) ---\n")
+        handle.write(f"Model: {model_name}\n")
+        handle.write(f"Selection mode: Final — {selection_mode}\n")
+        handle.write(f"Optimal feature count: {len(result['final_features'])}\n")
+        handle.write(f"Features: {', '.join(result['final_features'])}\n")
+        handle.write("\n--- PRIMARY: Untouched Final Test ---\n")
         handle.write(f"Final Test MAE: {result['test_mae']:.4f} kcal/mol\n")
         handle.write(f"Final Test R²:  {result['test_r2']:.4f}\n")
         handle.write(
@@ -355,25 +405,30 @@ def _write_final_metrics(
         )
         handle.write("\n--- SECONDARY: Development-Only Validation ---\n")
         handle.write(
-            f"Internal CV MAE: {internal_cv['rkf_mae_mean']:.4f} "
+            f"{INTERNAL_CV_LABEL} MAE: {internal_cv['rkf_mae_mean']:.4f} "
             f"± {internal_cv['rkf_mae_std']:.4f}\n"
         )
         handle.write(
-            f"Internal CV R²:  {internal_cv['rkf_r2_mean']:.4f} "
+            f"{INTERNAL_CV_LABEL} R²:  {internal_cv['rkf_r2_mean']:.4f} "
             f"± {internal_cv['rkf_r2_std']:.4f}\n"
         )
         handle.write(
-            f"100-split stability MAE: {stability['mae_mean']:.4f} "
+            f"100-split MAE: {stability['mae_mean']:.4f} "
             f"± {stability['mae_std']:.4f}\n"
         )
         handle.write(f"LOOCV MAE: {loo['mae']:.4f}\n")
         handle.write(f"LOOCV R²:  {loo['r2']:.4f}\n")
         handle.write("\n--- Compatibility aliases ---\n")
-        handle.write("mae_test_avg = Final Test MAE (PRIMARY)\n")
-        handle.write("r2_test_avg = Final Test R² (PRIMARY)\n")
-        handle.write("mae_mean = 100-split development stability MAE (secondary)\n")
-        handle.write("rkf_* = development internal CV (secondary)\n")
-        handle.write(f"\nComplete Parameters: {result['complete_params']}\n")
+        handle.write("mae_test_avg = Final Test MAE\n")
+        handle.write("r2_test_avg = Final Test R²\n")
+        handle.write("mae_mean = 100-split development MAE\n")
+        handle.write("rkf_* = development Internal 5×5 RepeatedKFold CV\n")
+        _write_params_block(handle, "Selected Complete Parameters", result["complete_params"])
+        _write_iteration_path_table(
+            handle,
+            result["shap_rfecv_path"],
+            selected_n_features=len(result["final_features"]),
+        )
         if getattr(estimator, "formula_", None):
             handle.write(f"\nGPlearn Formula:\n  {estimator.formula_}\n")
 
@@ -434,6 +489,32 @@ def _write_final_artifacts_atomically(
         for path in created_canonical_paths:
             _remove_if_exists(path)
         raise
+
+
+def _write_iteration_metrics(path, model_name, entry, artifacts, loo_r2, loo_mae):
+    internal_cv = entry["metrics"]["internal_cv"]
+    stability = entry["metrics"]["stability"]
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"Model: {model_name}\n")
+        handle.write(f"Iteration: {entry['iteration']}\n")
+        handle.write(f"Feature count: {entry['n_features']}\n")
+        handle.write(f"Features: {', '.join(entry['features'])}\n")
+        handle.write("All metrics below are SECONDARY and development-only.\n")
+        handle.write(
+            f"{INTERNAL_CV_LABEL} MAE: {internal_cv['rkf_mae_mean']:.4f} "
+            f"± {internal_cv['rkf_mae_std']:.4f}\n"
+        )
+        handle.write(
+            f"{INTERNAL_CV_LABEL} R²: {internal_cv['rkf_r2_mean']:.4f} "
+            f"± {internal_cv['rkf_r2_std']:.4f}\n"
+        )
+        handle.write(f"LOOCV MAE: {loo_mae:.4f}\n")
+        handle.write(f"LOOCV R²: {loo_r2:.4f}\n")
+        handle.write(
+            f"100-split MAE: {stability['mae_mean']:.4f} "
+            f"± {stability['mae_std']:.4f}\n"
+        )
+        _write_params_block(handle, "Complete Parameters", artifacts["complete_params"])
 
 
 def iterative_optimization(
@@ -571,7 +652,7 @@ def iterative_optimization(
             shap_rfecv_path = []
             candidate_estimator = artifacts["estimator"]
             _append_performance_history(
-                performance_history, selected_entry, "None (single pass)"
+                performance_history, selected_entry, "None single pass"
             )
         else:
             iteration = 0
@@ -611,18 +692,21 @@ def iterative_optimization(
 
                 internal_cv = entry["metrics"]["internal_cv"]
                 logger.info(
-                    "Iteration %d: %d features | internal CV MAE %.4f ± %.4f "
-                    "(secondary, development only)",
+                    "Iteration %d: %d features | %s MAE %.4f ± %.4f",
                     iteration,
                     entry["n_features"],
+                    INTERNAL_CV_LABEL,
                     internal_cv["rkf_mae_mean"],
                     internal_cv["rkf_mae_std"],
                 )
+                logger.info(
+                    "Iteration %d complete parameters: %s",
+                    iteration,
+                    _params_one_line(artifacts["complete_params"]),
+                )
 
                 checkpoint_model, checkpoint_scaler_X, checkpoint_scaler_y, _ = (
-                    _fit_on_development(
-                        artifacts["estimator"], X_model, y_development
-                    )
+                    _fit_on_development(artifacts["estimator"], X_model, y_development)
                 )
                 checkpoint_path = os.path.join(
                     model_dir,
@@ -645,38 +729,27 @@ def iterative_optimization(
                     },
                 }
                 joblib.dump(checkpoint_info, f"{checkpoint_path}.joblib")
-                with open(
-                    f"{checkpoint_path}_metrics.txt", "w", encoding="utf-8"
-                ) as handle:
-                    handle.write(
-                        f"Model: {model_name}\nIteration: {iteration}\n"
-                        f"Features ({X_model.shape[1]}): {', '.join(X_model.columns)}\n"
-                        "All metrics below are SECONDARY and development-only.\n"
-                        f"Internal CV MAE: {internal_cv['rkf_mae_mean']:.4f} "
-                        f"± {internal_cv['rkf_mae_std']:.4f}\n"
-                        f"LOOCV MAE: {loo_mae:.4f}\n"
-                        f"100-split stability MAE: "
-                        f"{artifacts['stability_mae_mean']:.4f} "
-                        f"± {artifacts['stability_mae_std']:.4f}\n"
-                        f"Complete Parameters: {artifacts['complete_params']}\n"
-                    )
+                _write_iteration_metrics(
+                    f"{checkpoint_path}_metrics.txt",
+                    model_name,
+                    entry,
+                    artifacts,
+                    loo_r2,
+                    loo_mae,
+                )
 
                 if X_model.shape[1] <= effective_min_features:
                     break
 
                 from src.feature_selection import shap_rfecv_select_worst_feature
 
-                use_consensus = X_model.shape[1] <= max(
-                    10, effective_min_features + 3
-                )
-                worst_feature, ranking, removal_reason = (
-                    shap_rfecv_select_worst_feature(
-                        artifacts["estimator"],
-                        X_model,
-                        y_development,
-                        model_name,
-                        cv_folds=5 if use_consensus else 0,
-                    )
+                use_consensus = X_model.shape[1] <= max(10, effective_min_features + 3)
+                worst_feature, ranking, removal_reason = shap_rfecv_select_worst_feature(
+                    artifacts["estimator"],
+                    X_model,
+                    y_development,
+                    model_name,
+                    cv_folds=5 if use_consensus else 0,
                 )
                 logger.info(
                     "SHAP-RFECV removes %s (%s); ranking=%s",
@@ -688,12 +761,8 @@ def iterative_optimization(
                 removed_features.append(worst_feature)
                 X_model = X_model.drop(columns=[worst_feature])
 
-            selected_entry = _select_path_entry(
-                shap_rfecv_path, force_n_features, logger
-            )
-            candidate_estimator = candidate_estimators[
-                selected_entry["n_features"]
-            ]
+            selected_entry = _select_path_entry(shap_rfecv_path, force_n_features, logger)
+            candidate_estimator = candidate_estimators[selected_entry["n_features"]]
 
         final_features = list(selected_entry["features"])
         final_estimator, scaler_X, scaler_y, _ = _fit_on_development(
@@ -730,25 +799,17 @@ def iterative_optimization(
         selected_history_index = performance_history["remaining_features"].index(
             len(final_features)
         )
-        performance_history["final_test_mae"][
-            selected_history_index
-        ] = test_mae
-        performance_history["final_test_r2"][
-            selected_history_index
-        ] = test_r2
+        performance_history["final_test_mae"][selected_history_index] = test_mae
+        performance_history["final_test_r2"][selected_history_index] = test_r2
 
         plot_performance_history(
             performance_history,
             model_name,
-            os.path.join(
-                model_dir, f"performance_history_{run_timestamp}.png"
-            ),
+            os.path.join(model_dir, f"performance_history_{run_timestamp}.png"),
         )
         save_performance_history(
             performance_history,
-            os.path.join(
-                model_dir, f"performance_history_{run_timestamp}.csv"
-            ),
+            os.path.join(model_dir, f"performance_history_{run_timestamp}.csv"),
         )
 
         final_model_info = {
@@ -772,9 +833,7 @@ def iterative_optimization(
             "shap_rfecv_path_summary": shap_rfecv_path,
             "evaluation_protocol": dict(evaluation_protocol),
         }
-        final_model_path = os.path.join(
-            model_dir, f"{model_name}_final_{run_timestamp}"
-        )
+        final_model_path = os.path.join(model_dir, f"{model_name}_final_{run_timestamp}")
 
         internal_cv = result["internal_cv"]
         plot_scatter(
@@ -782,7 +841,7 @@ def iterative_optimization(
             y_pred_train=y_pred_development,
             y_test=y_final_test,
             y_pred_test=y_pred_final_test,
-            model_name=f"{model_name} ({len(final_features)} features)",
+            model_name=f"{model_name} — {len(final_features)} features",
             mae_mean=result["stability"]["mae_mean"],
             output_dir=model_dir + os.sep,
             output_name=f"final_scatter_{run_timestamp}.png",
@@ -807,11 +866,12 @@ def iterative_optimization(
         clean_old_versions(model_dir, keep_versions)
 
         logger.info(
-            "%s complete | Final Test PRIMARY: MAE %.4f, R² %.4f | "
-            "Development internal CV secondary: MAE %.4f ± %.4f",
+            "%s complete | Final Test MAE %.4f, R² %.4f | "
+            "Development %s MAE %.4f ± %.4f",
             model_name,
             test_mae,
             test_r2,
+            INTERNAL_CV_LABEL,
             internal_cv["rkf_mae_mean"],
             internal_cv["rkf_mae_std"],
         )
@@ -851,15 +911,13 @@ def plot_performance_history(history, model_name, output_path):
         history.get("final_test_r2", [np.nan] * len(iterations)), dtype=float
     )
 
-    fig, (ax_mae, ax_r2) = plt.subplots(
-        2, 1, figsize=(14, 12), sharex=True
-    )
+    fig, (ax_mae, ax_r2) = plt.subplots(2, 1, figsize=(14, 12), sharex=True)
     ax_mae.plot(
         iterations,
         internal_cv_mae,
         "b-o",
         linewidth=2,
-        label="Internal CV MAE (secondary; development only)",
+        label=f"{RKF_PLOT_LABEL} MAE",
     )
     ax_mae.fill_between(
         iterations,
@@ -873,7 +931,7 @@ def plot_performance_history(history, model_name, output_path):
         stability_mae,
         "s--",
         color="gray",
-        label="100-split stability MAE (secondary; development only)",
+        label=STABILITY_PLOT_LABEL,
     )
     if len(loo_mae):
         ax_mae.plot(
@@ -881,7 +939,7 @@ def plot_performance_history(history, model_name, output_path):
             loo_mae,
             "d-",
             color="green",
-            label="LOOCV MAE (secondary; development only)",
+            label="LOOCV MAE",
         )
     final_mae_mask = np.isfinite(final_test_mae)
     if final_mae_mask.any():
@@ -891,7 +949,7 @@ def plot_performance_history(history, model_name, output_path):
             marker="*",
             s=220,
             color="black",
-            label="Final Test MAE (PRIMARY; evaluated once)",
+            label="Final Test MAE",
             zorder=5,
         )
 
@@ -900,7 +958,7 @@ def plot_performance_history(history, model_name, output_path):
         internal_cv_r2,
         "r-o",
         linewidth=2,
-        label="Internal CV R² (secondary; development only)",
+        label=f"{RKF_PLOT_LABEL} R²",
     )
     ax_r2.fill_between(
         iterations,
@@ -915,7 +973,7 @@ def plot_performance_history(history, model_name, output_path):
             loo_r2,
             "d-",
             color="orange",
-            label="LOOCV R² (secondary; development only)",
+            label="LOOCV R²",
         )
     final_r2_mask = np.isfinite(final_test_r2)
     if final_r2_mask.any():
@@ -925,17 +983,14 @@ def plot_performance_history(history, model_name, output_path):
             marker="*",
             s=220,
             color="black",
-            label="Final Test R² (PRIMARY; evaluated once)",
+            label="Final Test R²",
             zorder=5,
         )
 
-    ax_mae.set_ylabel("MAE (kcal/mol)\nlower is better")
-    ax_mae.set_title(
-        f"{model_name} — Development Selection Path and Final Test",
-        fontweight="bold",
-    )
+    ax_mae.set_ylabel("MAE\nkcal/mol")
+    ax_mae.set_title(f"{model_name} — Feature Selection Path", fontweight="bold")
     ax_r2.set_xlabel("Iteration")
-    ax_r2.set_ylabel("R²\nhigher is better")
+    ax_r2.set_ylabel("R²")
 
     for axis in (ax_mae, ax_r2):
         axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
@@ -946,7 +1001,7 @@ def plot_performance_history(history, model_name, output_path):
         zip(history["removed_feature"], history["remaining_features"])
     ):
         ax_mae.annotate(
-            f"{feature}\n({remaining} left)",
+            f"{feature}\n{remaining} left",
             (iterations[index], internal_cv_mae[index]),
             xytext=(5, 5),
             textcoords="offset points",
@@ -964,6 +1019,4 @@ def plot_performance_history(history, model_name, output_path):
 def save_performance_history(history, output_path):
     """Save performance history to CSV."""
     pd.DataFrame(history).to_csv(output_path, index=False)
-    logging.getLogger(__name__).info(
-        "Performance history saved to: %s", output_path
-    )
+    logging.getLogger(__name__).info("Performance history saved to: %s", output_path)
