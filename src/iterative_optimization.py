@@ -183,13 +183,13 @@ def _write_iteration_path_table(handle, shap_rfecv_path, selected_n_features=Non
         "Iter",
         "Feat",
         "Selected",
-        "Removed_before",
         f"{INTERNAL_CV_LABEL} MAE",
         f"{INTERNAL_CV_LABEL} R2",
         "LOOCV R2",
         "LOOCV MAE",
         "100-split MAE",
         "Complete Parameters",
+        "Removed_before",
     ]
     handle.write("\n--- Iteration Parameter Path ---\n")
     handle.write("\t".join(columns) + "\n")
@@ -203,13 +203,13 @@ def _write_iteration_path_table(handle, shap_rfecv_path, selected_n_features=Non
             str(entry["iteration"]),
             str(entry["n_features"]),
             selected,
-            ", ".join(entry.get("removed_features", [])),
             f"{internal_cv['rkf_mae_mean']:.4f} ± {internal_cv['rkf_mae_std']:.4f}",
             f"{internal_cv['rkf_r2_mean']:.4f} ± {internal_cv['rkf_r2_std']:.4f}",
             f"{loo['r2']:.4f}",
             f"{loo['mae']:.4f}",
             f"{stability['mae_mean']:.4f} ± {stability['mae_std']:.4f}",
             _params_one_line(entry["complete_params"]),
+            ", ".join(entry.get("removed_features", [])),
         ]
         handle.write("\t".join(row) + "\n")
 
