@@ -442,6 +442,7 @@ def iterative_optimization(
     y,
     n_trials=100,
     n_jobs=-1,
+    optuna_jobs=1,
     keep_versions=2,
     min_features=5,
     custom_min_features=None,
@@ -457,6 +458,9 @@ def iterative_optimization(
     after the feature set and complete estimator configuration are fixed.
     """
     keep_versions = _validate_keep_versions(keep_versions)
+    if not isinstance(optuna_jobs, Integral) or isinstance(optuna_jobs, bool) or optuna_jobs < 1:
+        raise ValueError("optuna_jobs must be a positive integer")
+    optuna_jobs = int(optuna_jobs)
 
     if force_n_features is not None and any(
         model_class == GPLearnRegressor for model_class in models.values()
@@ -546,6 +550,7 @@ def iterative_optimization(
                 y_development,
                 n_trials=n_trials,
                 n_jobs=n_jobs,
+                optuna_jobs=optuna_jobs,
                 random_state=40,
             )
             loo_r2, loo_mae = _safe_loo(
@@ -578,6 +583,7 @@ def iterative_optimization(
                     y_development,
                     n_trials=n_trials,
                     n_jobs=n_jobs,
+                    optuna_jobs=optuna_jobs,
                     random_state=40,
                 )
                 loo_r2, loo_mae = _safe_loo(
