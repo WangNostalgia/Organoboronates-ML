@@ -4,7 +4,7 @@
 
 [English](README.md) | [中文](README_CN.md)
 
-This repository provides a machine-learning workflow for organoboronate activation-energy prediction.
+This repository provides a machine-learning workflow for organoboronate activation-energy prediction. The current task format is single-sample regression: one compound/conformer/record maps to one `activation_energy` value.
 
 Active references:
 
@@ -19,6 +19,19 @@ Active references:
 
 The default runtime includes the scikit-learn stack plus XGBoost, LightGBM, CatBoost, and `gplearn==0.4.2`.
 
+## Input data format
+
+Training data should look like:
+
+```text
+ID, SMILES, filename, activation_energy, descriptor_1, descriptor_2, ...
+```
+
+- `activation_energy` is the target for training and labelled evaluation.
+- `ID`, `SMILES`, and `filename` are recommended metadata columns and are not used as model features.
+- Model features are numeric descriptor columns.
+- External prediction CSVs may omit `activation_energy`; this triggers prediction-only mode.
+
 ## Quick start
 
 ```bash
@@ -27,6 +40,15 @@ python main.py --n_trials 100 --min_features 5
 python main.py --n_trials 20 --min_features 5
 python main.py --help
 python example/standalone_y_randomization.py
+```
+
+Useful post-training commands:
+
+```bash
+python example/manual_selection_and_plot.py
+python src/external_validation.py --list-models
+python src/external_validation.py --model SVR --n_features 5 --data external.csv
+python src/applicability_domain.py --model SVR --n_features 5 --training example/B_dataset.csv --external external.csv
 ```
 
 ## Active default model registry
@@ -61,14 +83,15 @@ python example/standalone_y_randomization.py
 - Development set: tuning, SHAP feature elimination, feature-count path evaluation, internal 5×5 RepeatedKFold, LOOCV, and 100-split stability
 - Final test set: scored exactly once after the feature count and hyperparameters are locked
 
-The final test split is never used for model selection.
+The final test split is never used for model selection. Split indices are saved in checkpoint `evaluation_protocol` metadata and reused by post-processing scripts.
 
 ### 2. Development-only tuning
 
 `src/train_and_evaluate.py` tunes on development data only.
 
 - Optuna uses an internal 5-fold MAE objective
-- the Optuna study is in memory for the run
+- Optuna trial parallelism is controlled by `--optuna_jobs`, default `1`
+- estimator-internal parallelism is controlled by `--model_jobs`, default `-1`
 - Ridge and Lasso use explicit fold-local alpha loops
 - every fold fits its own scalers on training data only, then inverse-transforms predictions before MAE/R²
 
@@ -79,11 +102,26 @@ For non-GPlearn models, each iteration removes exactly one feature:
 - remove the weaker member of a high-correlation pair first
 - otherwise remove the globally least important feature
 
-That path continues until the configured floor is reached. `--min_features` defaults to `5`.
+Multi-fold SHAP consensus uses training-fold background/maskers for non-tree explainers. That path continues until the configured floor is reached. `--min_features` defaults to `5`.
 
 `--force_n_features` still means “evaluate the path, then choose an exact feature count”, but `main.py` now rejects that option immediately for the default registry because the default run still includes GPlearn. Exact feature-count forcing is only valid for custom registries that exclude GPlearn.
 
-### 4. Metric roles and checkpoint schema
+### 4. Automatic final and manual-final artifacts
+
+Automatic final checkpoints are created after the feature count and hyperparameters are selected using development-only evidence. The final test is then evaluated once.
+
+Manual-final checkpoints are created by `example/manual_selection_and_plot.py` from `example/manual_feature_selection.csv`. This script:
+
+- exactly loads the requested iteration checkpoint
+- refuses closest-feature fallback
+- reuses checkpoint development/final-test indices
+- refits selected features and complete params on development rows
+- evaluates final test once
+- saves a manual-final checkpoint, metrics txt, and scatter plot labelled as manual feature-count selection
+
+Manual feature counts should be chosen before looking at final-test plots.
+
+### 5. Metric roles and checkpoint schema
 
 Final checkpoints use nested metrics:
 
@@ -101,7 +139,7 @@ Iteration checkpoints keep the development-path metrics in flat form:
 
 Legacy aliases may still appear for compatibility, but current readers should prefer the current keys first and only fall back to the aliases when needed.
 
-### 5. Standalone y-randomization
+### 6. Standalone y-randomization
 
 Automatic full-pipeline y-randomization remains disabled in the main workflow. The supported path is `example/standalone_y_randomization.py`, which:
 
@@ -111,7 +149,7 @@ Automatic full-pipeline y-randomization remains disabled in the main workflow. T
 - reports the corrected finite-permutation p-value `(b + 1) / (m + 1)`
 - writes each histogram to `models/y_randomization_<ModelName>.png`
 
-### 6. Checkpoint loading
+### 7. Checkpoint loading
 
 `src.external_validation.load_model()`:
 
@@ -123,7 +161,21 @@ Automatic full-pipeline y-randomization remains disabled in the main workflow. T
 
 `example/load_checkpoint_guide.py` follows that same selection logic and safely formats both current and legacy metric layouts.
 
-### 7. Applicability domain
+### 8. External validation and metadata preservation
+
+`src/external_validation.py` supports single-model and ensemble external validation.
+
+Prediction outputs preserve:
+
+- prioritized metadata columns such as `ID`, `SMILES`, and `filename`
+- all other non-feature, non-target metadata columns by default
+- model feature columns
+- predicted activation energy
+- ground-truth and error columns when `activation_energy` is present
+
+Use `--id-cols` to prioritize custom metadata columns, and `--only-id-cols` if you do not want to preserve all metadata.
+
+### 9. Applicability domain
 
 Applicability-domain analysis uses:
 
@@ -132,7 +184,7 @@ Applicability-domain analysis uses:
 - MAD-based residual scaling with finite fallbacks
 - leverage in descriptor space
 
-Prediction-only mode is leverage-only when external labels are absent; there is no external `sqrt(1-h)` correction term.
+Use `--allow-full-training-csv-for-ad` only if you intentionally accept full-CSV AD calibration. Prediction-only mode is leverage-only when external labels are absent; there is no external `sqrt(1-h)` correction term.
 
 ## CLI arguments for `main.py`
 
