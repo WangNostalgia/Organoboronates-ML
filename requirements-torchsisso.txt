@@ -1,0 +1,15 @@
+# Optional dependencies for the standalone TorchSISSO baseline.
+#
+# Install in a fresh environment:
+#   python -m pip install -r requirements-torchsisso.txt
+#
+# For GPU acceleration, install the CUDA-enabled PyTorch wheel recommended by
+# https://pytorch.org/get-started/locally/ before installing this file.
+
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+joblib>=1.3
+sympy>=1.12
+torch>=2.2
+TorchSisso>=0.1.8
