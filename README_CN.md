@@ -1,10 +1,10 @@
 # 稳定有机硼酸酯活化能预测机器学习工具
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-blue)]() [![License](https://img.shields.io/badge/License-MIT-green)]() [![DOI](https://img.shields.io/badge/DOI-10.1038%2Fs41467--025--60674--9-blue)](https://doi.org/10.1038/s41467-025-60674-9)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue)]() [![License](https://img.shields.io/badge/License-MIT-green)]()
 
 [English](README.md) | [中文](README_CN.md)
 
-本仓库是 Nature Communications 论文《Organometallic-type reactivity of stable organoboronates for selective (hetero)arene C−H/C-halogen borylation and beyond》的配套机器学习工作流代码。
+本仓库提供一个用于 organoboronates 活化能预测的机器学习工作流。
 
 当前有效文档：
 
