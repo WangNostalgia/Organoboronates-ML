@@ -4,14 +4,14 @@
   Standalone y-Randomization Test
 ===============================================================================
 
-Runs y-randomization independently on models and feature counts specified in
-a CSV file (same format as manual_selection_and_plot.py).
+Runs y-randomization independently on locked models and feature counts specified
+in a CSV file (same format as manual_selection_and_plot.py).
 
-Designed for final validation runs — after you have locked in the optimal
-model and feature set for each model, launch this script overnight to obtain
-the statistical p-value needed for publication.
+By default, the test is run only on the development rows recorded in each model
+checkpoint's evaluation_protocol["development_indices"]. This preserves the
+untouched final-test split created by the main training pipeline.
 
-The CSV format (same file used by manual_selection_and_plot.py):
+The CSV format:
     model_name,n_features
     SVR,5
     RandomForest,7
@@ -45,6 +45,8 @@ ALLOW_CLOSEST = False
 N_PERMS = 100
 RANDOM_SEED = 42
 DATA_PATH = 'example/B_dataset.csv'
+TARGET_COL = 'activation_energy'
+ALLOW_FULL_DATA_WITHOUT_PROTOCOL = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -68,14 +70,57 @@ def load_selections(csv_path):
     return selections
 
 
+def _development_data_from_checkpoint(data, model_info, model_name):
+    protocol = model_info.get('evaluation_protocol') or {}
+    development_indices = protocol.get('development_indices')
+
+    if not development_indices:
+        if ALLOW_FULL_DATA_WITHOUT_PROTOCOL:
+            logger.warning(
+                "%s checkpoint has no evaluation_protocol.development_indices; "
+                "falling back to full data because ALLOW_FULL_DATA_WITHOUT_PROTOCOL=True.",
+                model_name,
+            )
+            return data.copy()
+        raise ValueError(
+            f"{model_name} checkpoint does not contain "
+            "evaluation_protocol['development_indices']. Re-run main.py to create "
+            "protocol-aware checkpoints, or set ALLOW_FULL_DATA_WITHOUT_PROTOCOL=True "
+            "only for legacy exploratory analysis."
+        )
+
+    missing = [idx for idx in development_indices if idx not in data.index]
+    if missing:
+        preview = missing[:10]
+        raise ValueError(
+            f"{model_name} development_indices do not match {DATA_PATH}. "
+            f"Missing index labels: {preview}. Ensure the CSV is the same, "
+            "unreordered source file used during main.py training."
+        )
+
+    subset = data.loc[development_indices].copy()
+    logger.info(
+        "%s: using %d development rows for y-randomization; final-test rows remain untouched.",
+        model_name,
+        len(subset),
+    )
+    return subset
+
+
+def _make_xy(data):
+    if TARGET_COL not in data.columns:
+        raise ValueError(f"Input data must contain target column '{TARGET_COL}'.")
+    numeric_cols = data.select_dtypes(include=['number']).columns
+    X = data[numeric_cols].drop(TARGET_COL, axis=1)
+    y = data[TARGET_COL]
+    return X, y
+
+
 def main():
     selections = load_selections(SELECTION_CSV)
     logger.info("Loaded %d model(s) from %s", len(selections), SELECTION_CSV)
 
     data = pd.read_csv(DATA_PATH).dropna(axis=1, how='all')
-    numeric_cols = data.select_dtypes(include=['number']).columns
-    X = data[numeric_cols].drop('activation_energy', axis=1)
-    y = data['activation_energy']
 
     for model_name, n_features in selections.items():
         logger.info("=" * 60)
@@ -90,6 +135,8 @@ def main():
                 allow_closest=ALLOW_CLOSEST,
             )
             features = info['features']
+            development_data = _development_data_from_checkpoint(data, info, model_name)
+            X, y = _make_xy(development_data)
 
             logger.info(
                 "Loaded checkpoint from %s (%d actual features)",
