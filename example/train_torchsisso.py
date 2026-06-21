@@ -1,32 +1,10 @@
 #!/usr/bin/env python
 """Standalone TorchSISSO baseline for organoboronate activation-energy data.
 
-This script deliberately lives outside the default Optuna/SHAP-RFECV pipeline.
-TorchSISSO is a symbolic-regression baseline with a different fitting API, so we
-keep it isolated while preserving the repository's key evaluation rule:
-
-    one fixed 80/20 development/final-test split with random_state=40.
-
-Model selection is performed only inside the development set. The final test set
-is scored exactly once after the TorchSISSO hyperparameter grid has been chosen.
-
-Example
--------
-python example/train_torchsisso.py \
-    --data example/B_dataset.csv \
-    --target activation_energy \
-    --output_dir models/TorchSISSO \
-    --n_expansion 1 2 \
-    --n_term 1 2 \
-    --k 20 50 \
-    --operators + - "*" / "pow(2)" ln \
-    --initial_screening spearman 0.95
-
-Notes
------
-TorchSISSO returns compact symbolic equations. In this script the equations are
-learned on median-imputed and standardized descriptor values, not raw physical
-units. The saved feature mapping and scaler are therefore part of the model.
+The script keeps TorchSISSO outside the default Optuna/SHAP-RFECV registry while
+preserving the repository's evaluation rule: one fixed 80/20 development/final-
+test split with random_state=40, development-only model selection, and one final-
+test score after the symbolic equation is locked.
 """
 
 from __future__ import annotations
@@ -58,8 +36,6 @@ DEFAULT_DROP_COLUMNS = ("ID", "SMILES", "filename", "stoichiometry")
 
 @dataclass(frozen=True)
 class TorchSISSOParams:
-    """Serializable TorchSISSO search parameters."""
-
     n_expansion: int
     n_term: int
     k: int
@@ -71,12 +47,6 @@ class TorchSISSOParams:
 
 @dataclass
 class FittedTorchSISSO:
-    """Small wrapper used for saving final metadata.
-
-    The TorchSISSO model object itself may not be stable across package versions,
-    so the main reusable artifact is the fitted equation plus preprocessing.
-    """
-
     equation: str
     feature_names: list[str]
     original_feature_names: list[str]
@@ -100,121 +70,28 @@ def bounded_quantile(value: str) -> float:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train a standalone TorchSISSO symbolic-regression baseline with a "
-            "development-only model-selection grid and one final-test score."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Train a standalone TorchSISSO baseline.")
     parser.add_argument("--data", default="example/B_dataset.csv", help="Input CSV path.")
-    parser.add_argument(
-        "--target",
-        default="activation_energy",
-        help="Regression target column. Default: activation_energy.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="models/TorchSISSO",
-        help="Directory for metrics, predictions, and fitted metadata.",
-    )
-    parser.add_argument(
-        "--drop_columns",
-        nargs="*",
-        default=list(DEFAULT_DROP_COLUMNS),
-        help="Columns to drop before numeric feature selection.",
-    )
-    parser.add_argument(
-        "--test_size",
-        type=float,
-        default=0.2,
-        help="Final-test fraction. Keep at 0.2 to match the main pipeline.",
-    )
-    parser.add_argument(
-        "--random_state",
-        type=int,
-        default=40,
-        help="Seed for the shared development/final-test split.",
-    )
-    parser.add_argument(
-        "--cv_splits",
-        type=positive_int,
-        default=5,
-        help="RepeatedKFold split count inside development data.",
-    )
-    parser.add_argument(
-        "--cv_repeats",
-        type=positive_int,
-        default=5,
-        help="RepeatedKFold repeat count inside development data.",
-    )
-    parser.add_argument(
-        "--max_grid_fits",
-        type=positive_int,
-        default=None,
-        help="Optional cap on parameter combinations for smoke tests.",
-    )
-    parser.add_argument(
-        "--n_expansion",
-        type=positive_int,
-        nargs="+",
-        default=[1, 2],
-        help="TorchSISSO feature-expansion depths to search.",
-    )
-    parser.add_argument(
-        "--n_term",
-        type=positive_int,
-        nargs="+",
-        default=[1, 2, 3],
-        help="Number of terms in the final equation.",
-    )
-    parser.add_argument(
-        "--k",
-        type=positive_int,
-        nargs="+",
-        default=[20, 50],
-        help="Number of SIS-screened features passed to L0 regularization.",
-    )
-    parser.add_argument(
-        "--operators",
-        nargs="+",
-        default=DEFAULT_OPERATORS,
-        help=(
-            "Operators used for feature construction. Conservative default: "
-            "+ - * / pow(2) ln. Quote shell-sensitive operators such as '*'."
-        ),
-    )
-    parser.add_argument(
-        "--initial_screening",
-        nargs=2,
-        metavar=("METHOD", "QUANTILE"),
-        default=None,
-        help=(
-            "Optional TorchSISSO initial screening, e.g. 'spearman 0.95' or "
-            "'mi 0.95'. The second value is parsed as a quantile in (0, 1]."
-        ),
-    )
-    parser.add_argument(
-        "--use_gpu",
-        action="store_true",
-        help="Pass use_gpu=True to TorchSISSO. Requires a CUDA-enabled torch install.",
-    )
-    parser.add_argument(
-        "--no_cv",
-        action="store_true",
-        help=(
-            "Smoke-test mode: skip development CV and fit only the first parameter "
-            "combination on the development set before final-test scoring."
-        ),
-    )
+    parser.add_argument("--target", default="activation_energy", help="Regression target column.")
+    parser.add_argument("--output_dir", default="models/TorchSISSO", help="Output directory.")
+    parser.add_argument("--drop_columns", nargs="*", default=list(DEFAULT_DROP_COLUMNS))
+    parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--random_state", type=int, default=40)
+    parser.add_argument("--cv_splits", type=positive_int, default=5)
+    parser.add_argument("--cv_repeats", type=positive_int, default=5)
+    parser.add_argument("--max_grid_fits", type=positive_int, default=None)
+    parser.add_argument("--n_expansion", type=positive_int, nargs="+", default=[1, 2])
+    parser.add_argument("--n_term", type=positive_int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--k", type=positive_int, nargs="+", default=[20, 50])
+    parser.add_argument("--operators", nargs="+", default=DEFAULT_OPERATORS)
+    parser.add_argument("--initial_screening", nargs=2, metavar=("METHOD", "QUANTILE"), default=None)
+    parser.add_argument("--use_gpu", action="store_true")
+    parser.add_argument("--no_cv", action="store_true", help="Smoke-test mode without development CV.")
     return parser.parse_args()
 
 
-def make_safe_feature_name(name: str, index: int) -> str:
-    """Create a stable SymPy/Python-safe feature name."""
-
-    cleaned = re.sub(r"\W+", "_", str(name)).strip("_")
-    if not cleaned:
-        cleaned = f"feature_{index}"
+def safe_feature_name(name: str, index: int) -> str:
+    cleaned = re.sub(r"\W+", "_", str(name)).strip("_") or f"feature_{index}"
     if cleaned[0].isdigit():
         cleaned = f"f_{cleaned}"
     return f"x{index:03d}_{cleaned}"
@@ -225,11 +102,7 @@ def load_numeric_dataset(
     target: str,
     drop_columns: Iterable[str],
 ) -> tuple[pd.DataFrame, pd.Series, dict[str, str]]:
-    """Load CSV data, keep numeric descriptors, and sanitize feature names."""
-
-    data = pd.read_csv(csv_path)
-    data = data.dropna(axis=1, how="all")
-
+    data = pd.read_csv(csv_path).dropna(axis=1, how="all")
     if target not in data.columns:
         raise ValueError(f"Target column '{target}' was not found in {csv_path}.")
 
@@ -239,33 +112,27 @@ def load_numeric_dataset(
         print(f"Dropped {rows_before - len(data)} rows with missing target values.")
 
     y = data[target].astype(float)
-    candidate = data.drop(columns=[target], errors="ignore")
-    candidate = candidate.drop(columns=list(drop_columns), errors="ignore")
-    X_numeric = candidate.select_dtypes(include=[np.number]).copy()
-    X_numeric = X_numeric.dropna(axis=1, how="all")
-
-    if X_numeric.empty:
+    X = data.drop(columns=[target], errors="ignore")
+    X = X.drop(columns=list(drop_columns), errors="ignore")
+    X = X.select_dtypes(include=[np.number]).dropna(axis=1, how="all").copy()
+    if X.empty:
         raise ValueError("No numeric feature columns remain after preprocessing.")
 
     mapping: dict[str, str] = {}
     safe_columns: list[str] = []
     used: set[str] = set()
-
-    for idx, column in enumerate(X_numeric.columns):
-        safe = make_safe_feature_name(str(column), idx)
+    for index, column in enumerate(X.columns):
+        safe = safe_feature_name(str(column), index)
         while safe in used:
             safe = f"{safe}_{len(used)}"
         used.add(safe)
         mapping[safe] = str(column)
         safe_columns.append(safe)
-
-    X_numeric.columns = safe_columns
-    return X_numeric, y, mapping
+    X.columns = safe_columns
+    return X, y, mapping
 
 
 def build_preprocessor() -> Pipeline:
-    """Median-impute and standardize features using training data only."""
-
     return Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
@@ -274,22 +141,14 @@ def build_preprocessor() -> Pipeline:
     )
 
 
-def transform_to_dataframe(
-    preprocessor: Pipeline,
-    X: pd.DataFrame,
-    feature_names: list[str],
-    fit: bool,
-) -> pd.DataFrame:
+def transform(preprocessor: Pipeline, X: pd.DataFrame, feature_names: list[str], fit: bool) -> pd.DataFrame:
     values = preprocessor.fit_transform(X) if fit else preprocessor.transform(X)
     return pd.DataFrame(values, columns=feature_names, index=X.index)
 
 
-def make_torchsisso_dataframe(X_scaled: pd.DataFrame, y: pd.Series, target: str) -> pd.DataFrame:
-    """TorchSISSO expects the target as the first dataframe column."""
-
-    aligned_y = y.loc[X_scaled.index]
+def make_sisso_df(X_scaled: pd.DataFrame, y: pd.Series, target: str) -> pd.DataFrame:
     return pd.concat(
-        [aligned_y.rename(target).reset_index(drop=True), X_scaled.reset_index(drop=True)],
+        [y.loc[X_scaled.index].rename(target).reset_index(drop=True), X_scaled.reset_index(drop=True)],
         axis=1,
     )
 
@@ -302,23 +161,19 @@ def build_param_grid(args: argparse.Namespace) -> list[TorchSISSOParams]:
         method = args.initial_screening[0]
         quantile = bounded_quantile(args.initial_screening[1])
 
-    params: list[TorchSISSOParams] = []
-    for n_expansion, n_term, k in itertools.product(args.n_expansion, args.n_term, args.k):
-        params.append(
-            TorchSISSOParams(
-                n_expansion=n_expansion,
-                n_term=n_term,
-                k=k,
-                operators=tuple(args.operators),
-                initial_screening_method=method,
-                initial_screening_quantile=quantile,
-                use_gpu=args.use_gpu,
-            )
+    grid = [
+        TorchSISSOParams(
+            n_expansion=n_expansion,
+            n_term=n_term,
+            k=k,
+            operators=tuple(args.operators),
+            initial_screening_method=method,
+            initial_screening_quantile=quantile,
+            use_gpu=args.use_gpu,
         )
-
-    if args.max_grid_fits is not None:
-        params = params[: args.max_grid_fits]
-    return params
+        for n_expansion, n_term, k in itertools.product(args.n_expansion, args.n_term, args.k)
+    ]
+    return grid[: args.max_grid_fits] if args.max_grid_fits is not None else grid
 
 
 def import_torchsisso():
@@ -326,22 +181,12 @@ def import_torchsisso():
         from TorchSisso import SissoModel
     except ImportError as exc:
         raise ImportError(
-            "TorchSisso is not installed. Install the optional environment with:\n"
-            "    python -m pip install -r requirements-torchsisso.txt\n"
-            "or install directly with:\n"
-            "    python -m pip install TorchSisso torch sympy"
+            "TorchSisso is not installed. Run: python -m pip install -r requirements-torchsisso.txt"
         ) from exc
     return SissoModel
 
 
-def fit_torchsisso(
-    train_df: pd.DataFrame,
-    params: TorchSISSOParams,
-) -> tuple[Any, float | None, str, float | None, Any]:
-    """Fit TorchSISSO and return model plus its native fit outputs."""
-
-    SissoModel = import_torchsisso()
-
+def fit_torchsisso(train_df: pd.DataFrame, params: TorchSISSOParams) -> tuple[Any, float | None, str, float | None, Any]:
     kwargs: dict[str, Any] = {
         "df": train_df,
         "operators": list(params.operators),
@@ -351,99 +196,41 @@ def fit_torchsisso(
         "use_gpu": params.use_gpu,
     }
     if params.initial_screening_method is not None:
-        kwargs["initial_screening"] = [
-            params.initial_screening_method,
-            params.initial_screening_quantile,
-        ]
+        kwargs["initial_screening"] = [params.initial_screening_method, params.initial_screening_quantile]
 
-    model = SissoModel(**kwargs)
-    fit_result = model.fit()
+    model = import_torchsisso()(**kwargs)
+    result = model.fit()
+    if not isinstance(result, tuple):
+        return model, None, str(result), None, None
 
-    rmse: float | None = None
-    equation = ""
-    r2: float | None = None
-    extra = None
-
-    if isinstance(fit_result, tuple):
-        if len(fit_result) > 0:
-            rmse = _safe_float_or_none(fit_result[0])
-        if len(fit_result) > 1:
-            equation = str(fit_result[1])
-        if len(fit_result) > 2:
-            r2 = _safe_float_or_none(fit_result[2])
-        if len(fit_result) > 3:
-            extra = fit_result[3]
-    else:
-        equation = str(fit_result)
-
-    return model, rmse, equation, r2, extra
+    native_rmse = _safe_float(result[0]) if len(result) > 0 else None
+    equation = str(result[1]) if len(result) > 1 else ""
+    native_r2 = _safe_float(result[2]) if len(result) > 2 else None
+    extra = result[3] if len(result) > 3 else None
+    return model, native_rmse, equation, native_r2, extra
 
 
-def _safe_float_or_none(value: Any) -> float | None:
+def _safe_float(value: Any) -> float | None:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    if math.isfinite(parsed):
-        return parsed
-    return None
+    return parsed if math.isfinite(parsed) else None
 
 
-def predict_with_torchsisso(
-    model: Any,
-    equation: str,
-    X_scaled: pd.DataFrame,
-) -> np.ndarray:
-    """Predict using TorchSISSO's predict method, falling back to equation parsing."""
-
-    predict = getattr(model, "predict", None)
-    if callable(predict):
-        prediction_attempts = (
-            lambda: predict(X_scaled),
-            lambda: predict(X_scaled.to_numpy()),
-            lambda: predict(pd.concat([pd.Series(np.nan, index=X_scaled.index, name="target"), X_scaled], axis=1)),
-        )
-        for attempt in prediction_attempts:
-            try:
-                y_pred = np.asarray(attempt(), dtype=float).reshape(-1)
-                if len(y_pred) == len(X_scaled) and np.all(np.isfinite(y_pred)):
-                    return y_pred
-            except Exception:
-                continue
-
-    return evaluate_equation(equation, X_scaled)
-
-
-def normalise_equation_string(equation: str) -> str:
-    """Convert common TorchSISSO equation text into a SymPy-friendly expression."""
-
-    text = str(equation).strip()
-    text = text.replace("^", "**")
-    text = text.replace("ln(", "log(")
-
-    # Strip simple left-hand sides such as "y = ..." or "activation_energy: ...".
+def normalise_equation(equation: str) -> str:
+    text = str(equation).strip().replace("^", "**").replace("ln(", "log(")
     if "=" in text:
         text = text.split("=", 1)[1].strip()
     elif ":" in text and text.split(":", 1)[0].strip().lower() in {"y", "target", "equation"}:
         text = text.split(":", 1)[1].strip()
-
-    # Some reprs wrap the expression in a list-like one-element container.
-    text = text.strip("[]")
-    return text
+    return text.strip("[]")
 
 
 def evaluate_equation(equation: str, X_scaled: pd.DataFrame) -> np.ndarray:
-    """Evaluate a returned symbolic equation against a scaled feature dataframe."""
+    import sympy as sp
 
-    try:
-        import sympy as sp
-    except ImportError as exc:
-        raise ImportError(
-            "sympy is required to evaluate TorchSISSO equations when the model "
-            "does not expose a working predict() method."
-        ) from exc
-
-    expression_text = normalise_equation_string(equation)
+    expression_text = normalise_equation(equation)
     symbols = {name: sp.Symbol(name) for name in X_scaled.columns}
     local_dict = {
         **symbols,
@@ -456,28 +243,39 @@ def evaluate_equation(equation: str, X_scaled: pd.DataFrame) -> np.ndarray:
         "Abs": sp.Abs,
         "abs": sp.Abs,
     }
-
     try:
         expression = sp.sympify(expression_text, locals=local_dict)
     except Exception as exc:
-        raise RuntimeError(
-            "Could not parse the TorchSISSO equation for out-of-sample "
-            f"prediction: {equation!r}. If the installed TorchSISSO version "
-            "stores predictions under a different API, adapt "
-            "predict_with_torchsisso()."
-        ) from exc
+        raise RuntimeError(f"Could not parse TorchSISSO equation: {equation!r}") from exc
 
     ordered_symbols = [symbols[name] for name in X_scaled.columns if symbols[name] in expression.free_symbols]
     if not ordered_symbols:
-        constant = float(expression)
-        return np.full(len(X_scaled), constant, dtype=float)
+        return np.full(len(X_scaled), float(expression), dtype=float)
 
     func = sp.lambdify(ordered_symbols, expression, modules="numpy")
-    values = [X_scaled[str(sym)].to_numpy(dtype=float) for sym in ordered_symbols]
-    y_pred = np.asarray(func(*values), dtype=float)
-    if y_pred.shape == ():
-        y_pred = np.full(len(X_scaled), float(y_pred), dtype=float)
-    return y_pred.reshape(-1)
+    values = [X_scaled[str(symbol)].to_numpy(dtype=float) for symbol in ordered_symbols]
+    prediction = np.asarray(func(*values), dtype=float)
+    if prediction.shape == ():
+        prediction = np.full(len(X_scaled), float(prediction), dtype=float)
+    return prediction.reshape(-1)
+
+
+def predict_with_torchsisso(model: Any, equation: str, X_scaled: pd.DataFrame) -> np.ndarray:
+    predict = getattr(model, "predict", None)
+    if callable(predict):
+        attempts = (
+            lambda: predict(X_scaled),
+            lambda: predict(X_scaled.to_numpy()),
+            lambda: predict(pd.concat([pd.Series(np.nan, index=X_scaled.index, name="target"), X_scaled], axis=1)),
+        )
+        for attempt in attempts:
+            try:
+                y_pred = np.asarray(attempt(), dtype=float).reshape(-1)
+                if len(y_pred) == len(X_scaled) and np.all(np.isfinite(y_pred)):
+                    return y_pred
+            except Exception:
+                continue
+    return evaluate_equation(equation, X_scaled)
 
 
 def regression_metrics(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -486,9 +284,11 @@ def regression_metrics(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> di
     if len(y_array) != len(pred_array):
         raise ValueError(f"Prediction length mismatch: {len(y_array)} != {len(pred_array)}")
 
+    # Compatible with both older and newer scikit-learn versions; avoid squared=False.
+    mse = float(mean_squared_error(y_array, pred_array))
     return {
         "mae": float(mean_absolute_error(y_array, pred_array)),
-        "rmse": float(mean_squared_error(y_array, pred_array, squared=False)),
+        "rmse": float(np.sqrt(mse)),
         "r2": float(r2_score(y_array, pred_array)),
     }
 
@@ -502,36 +302,25 @@ def evaluate_params_cv(
     cv_repeats: int,
     random_state: int,
 ) -> dict[str, Any]:
-    """Run fold-local preprocessing and TorchSISSO fitting inside development data."""
-
-    splitter = RepeatedKFold(
-        n_splits=cv_splits,
-        n_repeats=cv_repeats,
-        random_state=random_state,
-    )
-
-    fold_rows: list[dict[str, Any]] = []
+    splitter = RepeatedKFold(n_splits=cv_splits, n_repeats=cv_repeats, random_state=random_state)
     feature_names = list(X_dev.columns)
+    folds: list[dict[str, Any]] = []
 
-    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(X_dev), start=1):
-        X_train = X_dev.iloc[train_idx].copy()
-        X_val = X_dev.iloc[val_idx].copy()
-        y_train = y_dev.iloc[train_idx].copy()
-        y_val = y_dev.iloc[val_idx].copy()
-
+    for fold, (train_idx, val_idx) in enumerate(splitter.split(X_dev), start=1):
+        X_train, X_val = X_dev.iloc[train_idx], X_dev.iloc[val_idx]
+        y_train, y_val = y_dev.iloc[train_idx], y_dev.iloc[val_idx]
         preprocessor = build_preprocessor()
-        X_train_scaled = transform_to_dataframe(preprocessor, X_train, feature_names, fit=True)
-        X_val_scaled = transform_to_dataframe(preprocessor, X_val, feature_names, fit=False)
-        train_df = make_torchsisso_dataframe(X_train_scaled, y_train, target)
+        X_train_scaled = transform(preprocessor, X_train, feature_names, fit=True)
+        X_val_scaled = transform(preprocessor, X_val, feature_names, fit=False)
+        train_df = make_sisso_df(X_train_scaled, y_train, target)
 
         started = time.time()
         model, native_rmse, equation, native_r2, _ = fit_torchsisso(train_df, params)
         y_val_pred = predict_with_torchsisso(model, equation, X_val_scaled)
         metrics = regression_metrics(y_val, y_val_pred)
-
-        fold_rows.append(
+        folds.append(
             {
-                "fold": fold_idx,
+                "fold": fold,
                 "fit_seconds": time.time() - started,
                 "equation": equation,
                 "native_train_rmse": native_rmse,
@@ -540,15 +329,14 @@ def evaluate_params_cv(
             }
         )
 
-    summary: dict[str, Any] = {
+    return {
         **asdict(params),
-        "folds": fold_rows,
-        "cv_mae_mean": float(np.mean([row["val_mae"] for row in fold_rows])),
-        "cv_mae_std": float(np.std([row["val_mae"] for row in fold_rows], ddof=1)),
-        "cv_rmse_mean": float(np.mean([row["val_rmse"] for row in fold_rows])),
-        "cv_r2_mean": float(np.mean([row["val_r2"] for row in fold_rows])),
+        "folds": folds,
+        "cv_mae_mean": float(np.mean([row["val_mae"] for row in folds])),
+        "cv_mae_std": float(np.std([row["val_mae"] for row in folds], ddof=1)),
+        "cv_rmse_mean": float(np.mean([row["val_rmse"] for row in folds])),
+        "cv_r2_mean": float(np.mean([row["val_r2"] for row in folds])),
     }
-    return summary
 
 
 def fit_and_score_final(
@@ -560,44 +348,23 @@ def fit_and_score_final(
     params: TorchSISSOParams,
     mapping: dict[str, str],
 ) -> tuple[FittedTorchSISSO, pd.DataFrame, dict[str, Any]]:
-    """Refit on full development data and score once on the final test set."""
-
     feature_names = list(X_dev.columns)
     preprocessor = build_preprocessor()
-    X_dev_scaled = transform_to_dataframe(preprocessor, X_dev, feature_names, fit=True)
-    X_test_scaled = transform_to_dataframe(preprocessor, X_test, feature_names, fit=False)
+    X_dev_scaled = transform(preprocessor, X_dev, feature_names, fit=True)
+    X_test_scaled = transform(preprocessor, X_test, feature_names, fit=False)
+    train_df = make_sisso_df(X_dev_scaled, y_dev, target)
 
-    train_df = make_torchsisso_dataframe(X_dev_scaled, y_dev, target)
     model, native_rmse, equation, native_r2, extra = fit_torchsisso(train_df, params)
-
     dev_pred = predict_with_torchsisso(model, equation, X_dev_scaled)
     test_pred = predict_with_torchsisso(model, equation, X_test_scaled)
 
-    dev_metrics = regression_metrics(y_dev, dev_pred)
-    test_metrics = regression_metrics(y_test, test_pred)
-
     predictions = pd.concat(
         [
-            pd.DataFrame(
-                {
-                    "split": "development",
-                    "row_index": X_dev.index,
-                    "y_true": y_dev.to_numpy(dtype=float),
-                    "y_pred": dev_pred,
-                }
-            ),
-            pd.DataFrame(
-                {
-                    "split": "final_test",
-                    "row_index": X_test.index,
-                    "y_true": y_test.to_numpy(dtype=float),
-                    "y_pred": test_pred,
-                }
-            ),
+            pd.DataFrame({"split": "development", "row_index": X_dev.index, "y_true": y_dev.to_numpy(float), "y_pred": dev_pred}),
+            pd.DataFrame({"split": "final_test", "row_index": X_test.index, "y_true": y_test.to_numpy(float), "y_pred": test_pred}),
         ],
         ignore_index=True,
     )
-
     fitted = FittedTorchSISSO(
         equation=equation,
         feature_names=feature_names,
@@ -610,8 +377,8 @@ def fit_and_score_final(
         "native_train_rmse": native_rmse,
         "native_train_r2": native_r2,
         "native_extra": str(extra) if extra is not None else None,
-        "development": dev_metrics,
-        "final_test": test_metrics,
+        "development": regression_metrics(y_dev, dev_pred),
+        "final_test": regression_metrics(y_test, test_pred),
     }
     return fitted, predictions, metrics
 
@@ -629,15 +396,9 @@ def main() -> None:
     print(f"Loaded {len(X)} rows and {X.shape[1]} numeric features from {args.data}.")
 
     X_dev, X_test, y_dev, y_test = train_test_split(
-        X,
-        y,
-        test_size=args.test_size,
-        random_state=args.random_state,
+        X, y, test_size=args.test_size, random_state=args.random_state
     )
-    print(
-        f"Split data into development={len(X_dev)} and final_test={len(X_test)} "
-        f"with random_state={args.random_state}."
-    )
+    print(f"Split data into development={len(X_dev)} and final_test={len(X_test)} with random_state={args.random_state}.")
 
     param_grid = build_param_grid(args)
     if not param_grid:
@@ -649,8 +410,8 @@ def main() -> None:
         print(f"--no_cv enabled; using first parameter set: {best_params}")
     else:
         print(f"Evaluating {len(param_grid)} TorchSISSO parameter combinations inside development data.")
-        for idx, params in enumerate(param_grid, start=1):
-            print(f"[{idx}/{len(param_grid)}] {params}")
+        for index, params in enumerate(param_grid, start=1):
+            print(f"[{index}/{len(param_grid)}] {params}")
             try:
                 summary = evaluate_params_cv(
                     X_dev=X_dev,
@@ -662,10 +423,7 @@ def main() -> None:
                     random_state=42,
                 )
                 summary["status"] = "ok"
-                print(
-                    "    cv_mae_mean="
-                    f"{summary['cv_mae_mean']:.4f}, cv_r2_mean={summary['cv_r2_mean']:.4f}"
-                )
+                print(f"    cv_mae_mean={summary['cv_mae_mean']:.4f}, cv_r2_mean={summary['cv_r2_mean']:.4f}")
             except Exception as exc:
                 summary = {
                     **asdict(params),
@@ -683,7 +441,6 @@ def main() -> None:
         successful = [row for row in cv_results if row["status"] == "ok"]
         if not successful:
             raise RuntimeError("All TorchSISSO parameter combinations failed.")
-
         best_summary = min(successful, key=lambda row: row["cv_mae_mean"])
         best_params = TorchSISSOParams(
             n_expansion=int(best_summary["n_expansion"]),
@@ -709,11 +466,9 @@ def main() -> None:
     run_prefix = output_dir / f"torchsisso_{timestamp}"
 
     if cv_results:
-        flat_cv = []
-        for row in cv_results:
-            flat_row = {key: value for key, value in row.items() if key != "folds"}
-            flat_cv.append(flat_row)
-        pd.DataFrame(flat_cv).to_csv(f"{run_prefix}_cv_results.csv", index=False)
+        pd.DataFrame([{key: value for key, value in row.items() if key != "folds"} for row in cv_results]).to_csv(
+            f"{run_prefix}_cv_results.csv", index=False
+        )
         write_json(Path(f"{run_prefix}_cv_results_full.json"), {"results": cv_results})
 
     predictions.to_csv(f"{run_prefix}_predictions.csv", index=False)
