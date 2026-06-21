@@ -188,7 +188,7 @@ def import_torchsisso():
 
 def fit_torchsisso(train_df: pd.DataFrame, params: TorchSISSOParams) -> tuple[Any, float | None, str, float | None, Any]:
     kwargs: dict[str, Any] = {
-        "df": train_df,
+        "data": train_df,
         "operators": list(params.operators),
         "n_expansion": params.n_expansion,
         "n_term": params.n_term,
